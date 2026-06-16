@@ -27,6 +27,7 @@ interface UploadedTempFile {
   fieldName: string;
   originalName: string;
   tempPath: string;
+  sizeBytes: number;
 }
 
 const adminCookieName = 'watch_admin_session';
@@ -146,9 +147,47 @@ app.post('/watch/api/admin/upload', async (request, reply) => {
   if (!requireAdmin(request, reply)) return reply;
 
   const tempFiles: UploadedTempFile[] = [];
+  const abortController = new AbortController();
+  let uploadBodyRead = false;
+
+  const abortUpload = (reason: string): void => {
+    if (uploadBodyRead || abortController.signal.aborted) return;
+    request.log.warn(
+      {
+        reason,
+        tempFiles: tempFiles.map((file) => ({
+          fieldName: file.fieldName,
+          originalName: file.originalName,
+          tempPath: file.tempPath,
+          sizeBytes: file.sizeBytes
+        }))
+      },
+      'admin upload aborted'
+    );
+    abortController.abort(new Error(reason));
+  };
+
+  const onAborted = (): void => abortUpload('request aborted by client');
+  const onClose = (): void => abortUpload('request closed before upload body was fully read');
+  request.raw.on('aborted', onAborted);
+  request.raw.on('close', onClose);
 
   try {
-    const { fields, files } = await readMultipartUpload(request, tempFiles);
+    const { fields, files } = await readMultipartUpload(request, tempFiles, abortController.signal);
+    uploadBodyRead = true;
+
+    request.log.info(
+      {
+        fields: Object.keys(fields),
+        files: [...files.values()].map((file) => ({
+          fieldName: file.fieldName,
+          originalName: file.originalName,
+          sizeBytes: file.sizeBytes
+        }))
+      },
+      'admin upload body received'
+    );
+
     const kind = fields.kind === 'series' ? 'series' : 'film';
     const title = normalizeTitle(fields.title);
     if (!title) {
@@ -210,8 +249,24 @@ app.post('/watch/api/admin/upload', async (request, reply) => {
   } catch (error) {
     await Promise.allSettled(tempFiles.map((file) => rm(file.tempPath, { force: true })));
     const message = error instanceof Error ? error.message : String(error);
+    request.log.warn(
+      {
+        error: message,
+        aborted: abortController.signal.aborted,
+        tempFiles: tempFiles.map((file) => ({
+          fieldName: file.fieldName,
+          originalName: file.originalName,
+          tempPath: file.tempPath,
+          sizeBytes: file.sizeBytes
+        }))
+      },
+      'admin upload failed and temp files were removed'
+    );
     reply.code(400);
     return { error: message };
+  } finally {
+    request.raw.off('aborted', onAborted);
+    request.raw.off('close', onClose);
   }
 });
 
@@ -354,20 +409,37 @@ try {
 
 async function readMultipartUpload(
   request: FastifyRequest,
-  tempFiles: UploadedTempFile[]
+  tempFiles: UploadedTempFile[],
+  signal: AbortSignal
 ): Promise<{ fields: Record<string, string>; files: Map<string, UploadedTempFile> }> {
   const fields: Record<string, string> = {};
   const files = new Map<string, UploadedTempFile>();
+
+  request.log.debug('starting multipart parsing');
 
   for await (const part of request.parts()) {
     if (part.type === 'file') {
       const originalName = sanitizeFileName(part.filename ?? 'video');
       const extension = normalizeExtension(path.extname(originalName));
       const tempPath = path.join(appConfig.incomingDir, `${randomToken(12)}${extension}`);
-      await pipeline(part.file, createWriteStream(tempPath));
-      const tempFile = { fieldName: part.fieldname, originalName, tempPath };
+      const tempFile = { fieldName: part.fieldname, originalName, tempPath, sizeBytes: 0 };
       tempFiles.push(tempFile);
+
+      request.log.info(
+        { fieldName: part.fieldname, originalName, tempPath },
+        'started receiving uploaded file'
+      );
+
+      await pipeline(part.file, createWriteStream(tempPath), { signal });
+
+      const fileStat = await stat(tempPath);
+      tempFile.sizeBytes = fileStat.size;
       files.set(part.fieldname, tempFile);
+
+      request.log.info(
+        { fieldName: part.fieldname, originalName, tempPath, sizeBytes: tempFile.sizeBytes },
+        'finished receiving uploaded file'
+      );
     } else {
       fields[part.fieldname] = String(part.value ?? '').trim();
     }
