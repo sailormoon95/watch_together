@@ -168,9 +168,7 @@ app.post('/watch/api/admin/upload', async (request, reply) => {
   };
 
   const onAborted = (): void => abortUpload('request aborted by client');
-  const onClose = (): void => abortUpload('request closed before upload body was fully read');
   request.raw.on('aborted', onAborted);
-  request.raw.on('close', onClose);
 
   try {
     const { fields, files } = await readMultipartUpload(request, tempFiles, abortController.signal);
@@ -266,7 +264,6 @@ app.post('/watch/api/admin/upload', async (request, reply) => {
     return { error: message };
   } finally {
     request.raw.off('aborted', onAborted);
-    request.raw.off('close', onClose);
   }
 });
 
