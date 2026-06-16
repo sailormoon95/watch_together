@@ -3,10 +3,16 @@ import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { createRequire } from 'node:module';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { Store } from './database.js';
 
 const execFileAsync = promisify(execFile);
+const require = createRequire(import.meta.url);
+const ffmpegStaticPath = require('ffmpeg-static') as string | null;
+const ffprobeStatic = require('ffprobe-static') as { path?: string };
+const ffmpegPath = process.env.WATCH_FFMPEG_PATH ?? ffmpegStaticPath ?? 'ffmpeg';
+const ffprobePath = process.env.WATCH_FFPROBE_PATH ?? ffprobeStatic.path ?? 'ffprobe';
 
 interface ProbeResult {
   formatName: string;
@@ -152,7 +158,7 @@ function isBrowserMp4(probe: ProbeResult): boolean {
 
 async function probeVideo(filePath: string): Promise<ProbeResult> {
   const { stdout } = await execFileAsync(
-    'ffprobe',
+    ffprobePath,
     [
       '-v',
       'error',
@@ -184,7 +190,7 @@ async function probeVideo(filePath: string): Promise<ProbeResult> {
 
 async function runFfmpeg(args: string[]): Promise<void> {
   try {
-    await execFileAsync('ffmpeg', args, {
+    await execFileAsync(ffmpegPath, args, {
       timeout: 6 * 60 * 60 * 1000,
       maxBuffer: 8 * 1024 * 1024
     });
