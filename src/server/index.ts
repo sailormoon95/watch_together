@@ -1,5 +1,5 @@
 import { createWriteStream } from 'node:fs';
-import { mkdir, readFile, rename, rm, stat } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, stat, statfs } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
@@ -122,6 +122,24 @@ app.get('/watch/api/admin/me', async (request, reply) => {
 app.get('/watch/api/admin/items', async (request, reply) => {
   if (!requireAdmin(request, reply)) return reply;
   return { items: store.listItemsWithVideos().map(publicItem) };
+});
+
+app.get('/watch/api/admin/storage', async (request, reply) => {
+  if (!requireAdmin(request, reply)) return reply;
+
+  const stats = await statfs(appConfig.dataDir);
+  const blockSize = Number(stats.bsize);
+  const totalBytes = Number(stats.blocks) * blockSize;
+  const availableBytes = Number(stats.bavail) * blockSize;
+  const usedBytes = Math.max(totalBytes - availableBytes, 0);
+
+  return {
+    dataDir: appConfig.dataDir,
+    totalBytes,
+    availableBytes,
+    usedBytes,
+    usedPercent: totalBytes > 0 ? Math.round((usedBytes / totalBytes) * 1000) / 10 : 0
+  };
 });
 
 app.post('/watch/api/admin/upload', async (request, reply) => {

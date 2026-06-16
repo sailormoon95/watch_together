@@ -29,6 +29,14 @@ interface AdminItem {
   videos: AdminVideo[];
 }
 
+interface StorageInfo {
+  dataDir: string;
+  totalBytes: number;
+  availableBytes: number;
+  usedBytes: number;
+  usedPercent: number;
+}
+
 interface RoomVideo {
   id: string;
   episodeNumber: number | null;
@@ -127,10 +135,32 @@ function HomePage() {
   );
 }
 
+function StorageCard({ storage }: { storage: StorageInfo }) {
+  return (
+    <div className="storage-card">
+      <div>
+        <p className="eyebrow">Storage</p>
+        <h2>Место на диске</h2>
+        <p className="muted">Свободно: {formatBytes(storage.availableBytes)}</p>
+      </div>
+      <div className="storage-meter" aria-label={`Занято ${storage.usedPercent}%`}>
+        <div className="storage-meter-bar">
+          <span style={{ width: `${Math.min(storage.usedPercent, 100)}%` }} />
+        </div>
+        <p>
+          Занято {formatBytes(storage.usedBytes)} из {formatBytes(storage.totalBytes)} ·{' '}
+          {storage.usedPercent}%
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function AdminPage() {
   const [authState, setAuthState] = useState<AuthState>('checking');
   const [password, setPassword] = useState('');
   const [items, setItems] = useState<AdminItem[]>([]);
+  const [storage, setStorage] = useState<StorageInfo | null>(null);
   const [kind, setKind] = useState<LibraryKind>('film');
   const [title, setTitle] = useState('');
   const [episodeCount, setEpisodeCount] = useState(1);
@@ -138,6 +168,8 @@ function AdminPage() {
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [uploadSpeed, setUploadSpeed] = useState('');
   const [createdLinks, setCreatedLinks] = useState<Array<{ code: string; url: string }>>([]);
   const filmFileRef = useRef<HTMLInputElement>(null);
   const episodeFileRefs = useRef<Record<number, HTMLInputElement | null>>({});
@@ -150,10 +182,14 @@ function AdminPage() {
 
   useEffect(() => {
     if (authState !== 'in') return;
-    void loadItems();
-    const interval = window.setInterval(() => void loadItems(), 3000);
+    void loadAdminData();
+    const interval = window.setInterval(() => void loadAdminData(), 3000);
     return () => window.clearInterval(interval);
   }, [authState]);
+
+  async function loadAdminData() {
+    await Promise.allSettled([loadItems(), loadStorage()]);
+  }
 
   async function loadItems() {
     try {
@@ -161,6 +197,15 @@ function AdminPage() {
       setItems(response.items);
     } catch (err) {
       setError(getErrorMessage(err));
+    }
+  }
+
+  async function loadStorage() {
+    try {
+      const response = await apiJson<StorageInfo>(`${apiBase}/admin/storage`);
+      setStorage(response);
+    } catch {
+      setStorage(null);
     }
   }
 
@@ -189,6 +234,8 @@ function AdminPage() {
   async function upload(event: FormEvent) {
     event.preventDefault();
     setUploading(true);
+    setUploadProgress(0);
+    setUploadSpeed('0 Б/с');
     setError('');
     setMessage('');
 
@@ -211,13 +258,13 @@ function AdminPage() {
         }
       }
 
-      const response = await fetch(`${apiBase}/admin/upload`, {
-        method: 'POST',
-        body: formData,
-        credentials: 'same-origin'
+      await uploadFormData(`${apiBase}/admin/upload`, formData, (progress, bytesPerSecond) => {
+        setUploadProgress(progress);
+        setUploadSpeed(formatBytesPerSecond(bytesPerSecond));
       });
-      if (!response.ok) throw new Error(await readError(response));
 
+      setUploadProgress(100);
+      setUploadSpeed('');
       setMessage('Загрузка принята. Сервер обрабатывает видео в фоне.');
       resetUploadForm();
       await loadItems();
@@ -337,6 +384,8 @@ function AdminPage() {
           </button>
         </div>
 
+        {storage && <StorageCard storage={storage} />}
+
         <form onSubmit={upload} className="upload-box">
           <div className="segmented-control">
             <button
@@ -415,6 +464,21 @@ function AdminPage() {
           <button className="primary-button big-action" type="submit" disabled={uploading}>
             {uploading ? 'Загружаю...' : kind === 'film' ? 'Загрузить фильм' : 'Загрузить сериал'}
           </button>
+          {uploadProgress !== null && (
+            <div className="upload-progress" aria-live="polite">
+              <div className="upload-progress-bar">
+                <span style={{ width: `${uploadProgress}%` }} />
+              </div>
+              <strong>
+                {uploading
+                  ? uploadProgress >= 100
+                    ? '100% загружено, сервер принимает файл...'
+                    : `${uploadProgress}% загружено`
+                  : 'Файл успешно загружен на сервер'}
+              </strong>
+              {uploading && uploadSpeed && <span>{uploadSpeed}</span>}
+            </div>
+          )}
         </form>
 
         <p className="hint">
@@ -956,6 +1020,51 @@ function MediaTile({ label, stream, muted }: { label: string; stream: MediaStrea
   );
 }
 
+function uploadFormData(
+  url: string,
+  formData: FormData,
+  onProgress: (progress: number, bytesPerSecond: number) => void
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    let lastLoaded = 0;
+    let lastTime = performance.now();
+    let currentSpeed = 0;
+
+    request.open('POST', url);
+    request.withCredentials = true;
+
+    request.upload.onprogress = (event) => {
+      const now = performance.now();
+      const elapsedSeconds = Math.max((now - lastTime) / 1000, 0.001);
+      const loadedDelta = Math.max(event.loaded - lastLoaded, 0);
+
+      if (now - lastTime >= 300 || event.loaded === event.total) {
+        currentSpeed = loadedDelta / elapsedSeconds;
+        lastLoaded = event.loaded;
+        lastTime = now;
+      }
+
+      const progress = event.lengthComputable
+        ? Math.min(100, Math.max(0, Math.round((event.loaded / event.total) * 100)))
+        : 0;
+      onProgress(progress, currentSpeed);
+    };
+
+    request.onload = () => {
+      if (request.status >= 200 && request.status < 300) {
+        resolve();
+        return;
+      }
+      reject(new Error(readXhrError(request)));
+    };
+
+    request.onerror = () => reject(new Error('Ошибка сети при загрузке файла'));
+    request.onabort = () => reject(new Error('Загрузка отменена'));
+    request.send(formData);
+  });
+}
+
 async function apiJson<T>(url: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(url, {
     credentials: 'same-origin',
@@ -967,6 +1076,15 @@ async function apiJson<T>(url: string, init: RequestInit = {}): Promise<T> {
   });
   if (!response.ok) throw new Error(await readError(response));
   return (await response.json()) as T;
+}
+
+function readXhrError(request: XMLHttpRequest): string {
+  try {
+    const body = JSON.parse(request.responseText) as { error?: string; message?: string };
+    return body.error ?? body.message ?? request.statusText;
+  } catch {
+    return request.statusText || 'Upload failed';
+  }
 }
 
 async function deleteJson(url: string): Promise<void> {
@@ -1038,4 +1156,22 @@ function formatDuration(seconds: number | null): string {
   const rest = rounded % 60;
   if (hours > 0) return `${hours}ч ${minutes}м`;
   return `${minutes}м ${rest}с`;
+}
+
+function formatBytesPerSecond(bytesPerSecond: number): string {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return '0 Б/с';
+  return `${formatBytes(bytesPerSecond)}/с`;
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 Б';
+  const sizeUnits = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < sizeUnits.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const precision = value >= 10 || unitIndex === 0 ? 0 : 1;
+  return `${value.toFixed(precision)} ${sizeUnits[unitIndex]}`;
 }
