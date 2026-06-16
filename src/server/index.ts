@@ -54,7 +54,7 @@ const app = Fastify({
       }
     }
   },
-  bodyLimit: Math.min(appConfig.maxUploadBytes + 1024 * 1024, 2_147_483_647)
+  bodyLimit: appConfig.maxUploadBytes
 });
 
 await app.register(cookiePlugin, { secret: appConfig.sessionSecret });
