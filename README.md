@@ -1,0 +1,133 @@
+# Watch Together
+
+MVP веб-приложения для совместного просмотра фильма или сериала по короткой ссылке без авторизации зрителей.
+
+## Возможности
+
+- Админка `/watch/admin` защищена паролем из `.env`.
+- Загрузка фильма: название + один файл.
+- Загрузка сериала: название + количество серий + название и файл каждой серии.
+- Для фильма создается отдельная директория с названием фильма.
+- Для сериала создается директория сериала, внутри нее директории серий с номером и названием.
+- Удаление фильма, сериала или отдельной серии из админки.
+- Фоновая подготовка видео через `ffprobe`/`ffmpeg` в `MP4 H.264/AAC`.
+- Комната просмотра `/watch/r/<code>` по короткому коду, например `AB7K2Q`.
+- Для сериала одна ссылка ведет в комнату сериала, выбор серии синхронизируется у всех.
+- Видео отдается только через валидный код комнаты.
+- Поддержка HTTP `Range` для перемотки и буферизации.
+- Синхронизация `play`, `pause`, `seek`, выбора серии через WebSocket.
+- Коррекция небольшого рассинхрона через `playbackRate`.
+- Камера и микрофон по желанию через WebRTC peer-to-peer.
+- Интерфейс рассчитан на ноутбук, телефон и ТВ.
+- Расширенные структурные логи для отладки.
+- Docker logs ограничены 200 МБ: `20m x 10 files`.
+
+## Где брать ссылку
+
+В админке после обработки фильма или сериала нажмите `Создать ссылку`. Админка покажет короткий код и полный URL вида:
+
+```text
+https://plugin-ai.ru/watch/r/AB7K2Q
+```
+
+На главной `/watch` также можно ввести короткий код комнаты вручную.
+
+## Стек
+
+- Node.js 22
+- TypeScript
+- Fastify
+- JSON-хранилище на диске для MVP
+- React + Vite
+- ffmpeg/ffprobe
+- WebSocket + WebRTC
+
+## Локальный запуск
+
+```bash
+cp .env.example .env
+npm install
+npm run build
+npm start
+```
+
+Открыть:
+
+```text
+http://localhost:3000/watch/admin
+```
+
+Для разработки можно запустить отдельно backend и Vite:
+
+```bash
+npm run dev:server
+npm run dev:client
+```
+
+## Переменные окружения
+
+```text
+WATCH_ADMIN_PASSWORD=change-me
+WATCH_SESSION_SECRET=change-me-to-a-long-random-string
+WATCH_PUBLIC_BASE_URL=https://plugin-ai.ru/watch
+WATCH_DATA_DIR=./data
+WATCH_HOST=0.0.0.0
+WATCH_PORT=3000
+WATCH_LOG_LEVEL=debug
+WATCH_COOKIE_SECURE=true
+WATCH_MAX_UPLOAD_MB=8192
+WATCH_SESSION_TTL_HOURS=24
+```
+
+## Docker
+
+```bash
+cp .env.example .env
+docker compose build
+docker compose up -d
+```
+
+По умолчанию контейнер слушает локально на `127.0.0.1:3000`, чтобы reverse proxy отдавал приложение под `https://plugin-ai.ru/watch`.
+
+## Reverse Proxy
+
+Нужно прокинуть `/watch` на `http://127.0.0.1:3000` и сохранить WebSocket upgrade для `/watch/ws`.
+
+Пример Nginx:
+
+```nginx
+location /watch/ {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    client_max_body_size 8192m;
+}
+
+location = /watch {
+    return 301 /watch/;
+}
+```
+
+Для длинной загрузки больших файлов может понадобиться увеличить proxy timeout/body size в текущем reverse proxy.
+
+## Хранение данных
+
+```text
+data/store.json
+data/incoming
+data/media
+```
+
+Эти данные не коммитятся в git.
+
+## Ограничения MVP
+
+- Зрители без авторизации, безопасность ссылки держится на коротком случайном коде комнаты.
+- Камера/микрофон сделаны peer-to-peer, что нормально для 2 человек. Для больших комнат нужен SFU, например LiveKit.
+- Браузер может заблокировать удаленный автозапуск видео до первого пользовательского взаимодействия.
+- Абсолютная кадровая синхронизация невозможна, но приложение стремится держать рассинхрон в пределах долей секунды.
