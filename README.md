@@ -87,17 +87,17 @@ docker compose build
 docker compose up -d
 ```
 
-По умолчанию контейнер слушает локально на `127.0.0.1:3000`, чтобы reverse proxy отдавал приложение под `https://plugin-ai.ru/watch`.
+По умолчанию контейнер слушает локально на `127.0.0.1:3012`, чтобы reverse proxy отдавал приложение под `https://plugin-ai.ru/watch`.
 
 ## Reverse Proxy
 
-Нужно прокинуть `/watch` на `http://127.0.0.1:3000` и сохранить WebSocket upgrade для `/watch/ws`.
+Нужно прокинуть `/watch` на `http://127.0.0.1:3012` и сохранить WebSocket upgrade для `/watch/ws`.
 
 Пример Nginx:
 
 ```nginx
 location /watch/ {
-    proxy_pass http://127.0.0.1:3000;
+    proxy_pass http://127.0.0.1:3012;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;

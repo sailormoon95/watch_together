@@ -10,7 +10,7 @@ services:
       WATCH_PORT: 3000
       WATCH_DATA_DIR: /data
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:3012:3000"
     volumes:
       - ./data:/data
     healthcheck:
