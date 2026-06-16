@@ -173,6 +173,7 @@ function AdminPage() {
   const [createdLinks, setCreatedLinks] = useState<Array<{ code: string; url: string }>>([]);
   const filmFileRef = useRef<HTMLInputElement>(null);
   const episodeFileRefs = useRef<Record<number, HTMLInputElement | null>>({});
+  const cancelUploadRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     void apiJson(`${apiBase}/admin/me`)
@@ -258,10 +259,17 @@ function AdminPage() {
         }
       }
 
-      await uploadFormData(`${apiBase}/admin/upload`, formData, (progress, bytesPerSecond) => {
-        setUploadProgress(progress);
-        setUploadSpeed(formatBytesPerSecond(bytesPerSecond));
-      });
+      await uploadFormData(
+        `${apiBase}/admin/upload`,
+        formData,
+        (progress, bytesPerSecond) => {
+          setUploadProgress(progress);
+          setUploadSpeed(formatBytesPerSecond(bytesPerSecond));
+        },
+        (cancel) => {
+          cancelUploadRef.current = cancel;
+        }
+      );
 
       setUploadProgress(100);
       setUploadSpeed('');
@@ -269,10 +277,22 @@ function AdminPage() {
       resetUploadForm();
       await loadItems();
     } catch (err) {
-      setError(getErrorMessage(err));
+      setUploadProgress(null);
+      setUploadSpeed('');
+      if (err instanceof UploadCancelledError) {
+        setMessage('Загрузка прервана. Частично загруженный файл удален.');
+      } else {
+        setError(getErrorMessage(err));
+      }
     } finally {
+      cancelUploadRef.current = null;
       setUploading(false);
     }
+  }
+
+  function cancelUpload() {
+    setMessage('Прерываю загрузку...');
+    cancelUploadRef.current?.();
   }
 
   async function createRoom(itemId: string) {
@@ -461,9 +481,16 @@ function AdminPage() {
             </div>
           )}
 
-          <button className="primary-button big-action" type="submit" disabled={uploading}>
-            {uploading ? 'Загружаю...' : kind === 'film' ? 'Загрузить фильм' : 'Загрузить сериал'}
-          </button>
+          <div className="upload-actions">
+            <button className="primary-button big-action" type="submit" disabled={uploading}>
+              {uploading ? 'Загружаю...' : kind === 'film' ? 'Загрузить фильм' : 'Загрузить сериал'}
+            </button>
+            {uploading && (
+              <button className="danger-button big-action" type="button" onClick={cancelUpload}>
+                Прервать загрузку
+              </button>
+            )}
+          </div>
           {uploadProgress !== null && (
             <div className="upload-progress" aria-live="polite">
               <div className="upload-progress-bar">
@@ -1020,10 +1047,18 @@ function MediaTile({ label, stream, muted }: { label: string; stream: MediaStrea
   );
 }
 
+class UploadCancelledError extends Error {
+  constructor() {
+    super('Загрузка отменена');
+    this.name = 'UploadCancelledError';
+  }
+}
+
 function uploadFormData(
   url: string,
   formData: FormData,
-  onProgress: (progress: number, bytesPerSecond: number) => void
+  onProgress: (progress: number, bytesPerSecond: number) => void,
+  onCancelReady: (cancel: () => void) => void
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
@@ -1033,6 +1068,7 @@ function uploadFormData(
 
     request.open('POST', url);
     request.withCredentials = true;
+    onCancelReady(() => request.abort());
 
     request.upload.onprogress = (event) => {
       const now = performance.now();
@@ -1060,7 +1096,7 @@ function uploadFormData(
     };
 
     request.onerror = () => reject(new Error('Ошибка сети при загрузке файла'));
-    request.onabort = () => reject(new Error('Загрузка отменена'));
+    request.onabort = () => reject(new UploadCancelledError());
     request.send(formData);
   });
 }

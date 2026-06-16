@@ -343,6 +343,12 @@ input[type='file'] {
   min-height: 52px;
 }
 
+.upload-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
 .upload-progress {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -611,7 +617,8 @@ input[type='file'] {
   }
 
   .join-form,
-  .invite-card {
+  .invite-card,
+  .upload-actions {
     grid-template-columns: 1fr;
   }
 
