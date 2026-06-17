@@ -701,6 +701,7 @@ function RoomPage({ token }: { token: string }) {
     if (message.type === 'joined') {
       setMyPeerId(message.peerId);
       setPeers(message.peers);
+      for (const peer of message.peers) ensurePeerConnection(peer.peerId);
       lastStateRef.current = message.state;
       queueApplyState(message.state);
       return;
