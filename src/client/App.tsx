@@ -73,6 +73,7 @@ type ServerMessage =
   | { type: 'peer-joined'; peer: PeerInfo }
   | { type: 'peer-left'; peerId: string }
   | { type: 'sync-state'; serverNow: number; state: WatchState; sourcePeerId?: string }
+  | { type: 'buffer-wait'; waitId: string; serverNow: number; state: WatchState; sourcePeerId?: string }
   | { type: 'video-switched'; serverNow: number; state: WatchState; sourcePeerId?: string }
   | { type: 'signal'; sourcePeerId: string; data: SignalData }
   | { type: 'media-state'; peer: PeerInfo }
@@ -86,6 +87,14 @@ interface SignalData {
 interface LocalMediaState {
   audio: boolean;
   video: boolean;
+}
+
+interface BufferWaitState {
+  waitId: string;
+  videoId: string;
+  positionSeconds: number;
+  stateVersion: number;
+  readySent: boolean;
 }
 
 export function App() {
@@ -606,9 +615,15 @@ function RoomPage({ token }: { token: string }) {
   const wsRef = useRef<WebSocket | null>(null);
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const localStreamRef = useRef<MediaStream | null>(null);
+  const myPeerIdRef = useRef('');
+  const makingOfferRef = useRef<Map<string, boolean>>(new Map());
+  const ignoreOfferRef = useRef<Map<string, boolean>>(new Map());
+  const queuedOfferRef = useRef<Set<string>>(new Set());
+  const pendingCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
   const serverOffsetRef = useRef(0);
   const lastStateRef = useRef<WatchState | null>(null);
   const pendingStateRef = useRef<WatchState | null>(null);
+  const pendingBufferWaitRef = useRef<BufferWaitState | null>(null);
   const selectedVideoIdRef = useRef('');
   const suppressEventsRef = useRef(false);
 
@@ -640,6 +655,10 @@ function RoomPage({ token }: { token: string }) {
       wsRef.current?.close();
       for (const pc of peerConnectionsRef.current.values()) pc.close();
       peerConnectionsRef.current.clear();
+      makingOfferRef.current.clear();
+      ignoreOfferRef.current.clear();
+      queuedOfferRef.current.clear();
+      pendingCandidatesRef.current.clear();
       localStreamRef.current?.getTracks().forEach((track) => track.stop());
     };
   }, [token]);
@@ -699,9 +718,13 @@ function RoomPage({ token }: { token: string }) {
     if ('serverNow' in message) serverOffsetRef.current = message.serverNow - Date.now();
 
     if (message.type === 'joined') {
+      myPeerIdRef.current = message.peerId;
       setMyPeerId(message.peerId);
       setPeers(message.peers);
       for (const peer of message.peers) ensurePeerConnection(peer.peerId);
+      if (localStreamRef.current) {
+        for (const peer of message.peers) void createOffer(peer.peerId);
+      }
       lastStateRef.current = message.state;
       queueApplyState(message.state);
       return;
@@ -724,7 +747,27 @@ function RoomPage({ token }: { token: string }) {
       return;
     }
 
+    if (message.type === 'buffer-wait') {
+      pendingBufferWaitRef.current = {
+        waitId: message.waitId,
+        videoId: message.state.videoId,
+        positionSeconds: message.state.positionSeconds,
+        stateVersion: message.state.version,
+        readySent: false
+      };
+      setStatus('Ждем буферизацию у всех...');
+      lastStateRef.current = message.state;
+      queueApplyState(message.state);
+      window.setTimeout(maybeSendBufferReady, 0);
+      return;
+    }
+
     if (message.type === 'sync-state' || message.type === 'video-switched') {
+      const wait = pendingBufferWaitRef.current;
+      if (wait && message.state.version > wait.stateVersion) {
+        pendingBufferWaitRef.current = null;
+        setStatus('Онлайн');
+      }
       if (!lastStateRef.current || message.state.version >= lastStateRef.current.version) {
         lastStateRef.current = message.state;
         queueApplyState(message.state);
@@ -768,6 +811,8 @@ function RoomPage({ token }: { token: string }) {
       if (!state.playing && !video.paused) video.pause();
       if (!state.playing) video.playbackRate = 1;
     });
+
+    window.setTimeout(maybeSendBufferReady, 0);
   }
 
   function onVideoLoaded() {
@@ -777,9 +822,30 @@ function RoomPage({ token }: { token: string }) {
     applyWatchState(pending);
   }
 
+  function maybeSendBufferReady() {
+    const wait = pendingBufferWaitRef.current;
+    const video = videoRef.current;
+    if (!wait || wait.readySent || !video) return;
+    if (wait.videoId !== selectedVideoIdRef.current) return;
+    if (video.seeking || video.readyState < 3) return;
+    if (Math.abs(video.currentTime - wait.positionSeconds) > 1.25) return;
+
+    pendingBufferWaitRef.current = { ...wait, readySent: true };
+    setStatus('Готово, ждем остальных...');
+    sendWs({ type: 'buffer-ready', waitId: wait.waitId });
+  }
+
   function sendSyncAction(action: 'play' | 'pause' | 'seek') {
     const video = videoRef.current;
     if (!video || suppressEventsRef.current) return;
+    const wait = pendingBufferWaitRef.current;
+    if (action === 'seek' && wait) {
+      if (wait.videoId === selectedVideoIdRef.current && Math.abs(video.currentTime - wait.positionSeconds) <= 1.25) {
+        maybeSendBufferReady();
+        return;
+      }
+      pendingBufferWaitRef.current = null;
+    }
     sendWs({
       type: 'sync-action',
       action,
@@ -796,10 +862,14 @@ function RoomPage({ token }: { token: string }) {
 
   function ensurePeerConnection(peerId: string): RTCPeerConnection {
     const existing = peerConnectionsRef.current.get(peerId);
-    if (existing) return existing;
+    if (existing && existing.connectionState !== 'closed') return existing;
+    if (existing) peerConnectionsRef.current.delete(peerId);
 
     const pc = new RTCPeerConnection({
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun.cloudflare.com:3478' }
+      ]
     });
 
     peerConnectionsRef.current.set(peerId, pc);
@@ -823,8 +893,17 @@ function RoomPage({ token }: { token: string }) {
       });
     };
 
+    pc.onsignalingstatechange = () => {
+      if (pc.signalingState !== 'stable' || !queuedOfferRef.current.delete(peerId)) return;
+      void createOffer(peerId);
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      if (pc.iceConnectionState === 'failed') void createOffer(peerId, true);
+    };
+
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') removePeer(peerId);
+      if (pc.connectionState === 'failed') void createOffer(peerId, true);
     };
 
     return pc;
@@ -833,39 +912,89 @@ function RoomPage({ token }: { token: string }) {
   async function handleSignal(peerId: string, data: SignalData) {
     const pc = ensurePeerConnection(peerId);
 
-    if (data.description) {
-      await pc.setRemoteDescription(new RTCSessionDescription(data.description));
-      if (data.description.type === 'offer') {
-        syncLocalTracks(pc);
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        sendWs({
-          type: 'signal',
-          targetPeerId: peerId,
-          data: { description: pc.localDescription }
-        });
-      }
-      return;
-    }
+    try {
+      if (data.description) {
+        const description = new RTCSessionDescription(data.description);
+        const offerCollision = description.type === 'offer'
+          && (makingOfferRef.current.get(peerId) || pc.signalingState !== 'stable');
+        const ignoreOffer = !isPolitePeer(peerId) && offerCollision;
+        ignoreOfferRef.current.set(peerId, ignoreOffer);
+        if (ignoreOffer) return;
 
-    if (data.candidate) {
-      await pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch((err) => {
-        console.warn('Failed to add ICE candidate', err);
-      });
+        if (offerCollision) await pc.setLocalDescription({ type: 'rollback' });
+
+        await pc.setRemoteDescription(description);
+        await flushPendingCandidates(peerId, pc);
+
+        if (description.type === 'offer') {
+          syncLocalTracks(pc);
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          sendWs({
+            type: 'signal',
+            targetPeerId: peerId,
+            data: { description: pc.localDescription }
+          });
+        }
+        return;
+      }
+
+      if (data.candidate) {
+        if (ignoreOfferRef.current.get(peerId)) return;
+        if (!pc.remoteDescription) {
+          queuePendingCandidate(peerId, data.candidate);
+          return;
+        }
+        await addIceCandidate(pc, data.candidate);
+      }
+    } catch (err) {
+      console.warn('Failed to handle WebRTC signal', err);
     }
   }
 
-  async function createOffer(peerId: string) {
+  async function createOffer(peerId: string, iceRestart = false) {
     const pc = ensurePeerConnection(peerId);
-    if (pc.signalingState !== 'stable') return;
-    syncLocalTracks(pc);
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    sendWs({
-      type: 'signal',
-      targetPeerId: peerId,
-      data: { description: pc.localDescription }
+    if (pc.signalingState !== 'stable') {
+      queuedOfferRef.current.add(peerId);
+      return;
+    }
+
+    try {
+      makingOfferRef.current.set(peerId, true);
+      syncLocalTracks(pc);
+      const offer = await pc.createOffer({ iceRestart });
+      await pc.setLocalDescription(offer);
+      sendWs({
+        type: 'signal',
+        targetPeerId: peerId,
+        data: { description: pc.localDescription }
+      });
+    } catch (err) {
+      console.warn('Failed to create WebRTC offer', err);
+    } finally {
+      makingOfferRef.current.set(peerId, false);
+    }
+  }
+
+  async function flushPendingCandidates(peerId: string, pc: RTCPeerConnection) {
+    const candidates = pendingCandidatesRef.current.get(peerId) ?? [];
+    pendingCandidatesRef.current.delete(peerId);
+    for (const candidate of candidates) await addIceCandidate(pc, candidate);
+  }
+
+  async function addIceCandidate(pc: RTCPeerConnection, candidate: RTCIceCandidateInit) {
+    await pc.addIceCandidate(new RTCIceCandidate(candidate)).catch((err) => {
+      console.warn('Failed to add ICE candidate', err);
     });
+  }
+
+  function queuePendingCandidate(peerId: string, candidate: RTCIceCandidateInit) {
+    const candidates = pendingCandidatesRef.current.get(peerId) ?? [];
+    pendingCandidatesRef.current.set(peerId, [...candidates, candidate]);
+  }
+
+  function isPolitePeer(peerId: string): boolean {
+    return myPeerIdRef.current > peerId;
   }
 
   function syncLocalTracks(pc: RTCPeerConnection) {
@@ -916,6 +1045,10 @@ function RoomPage({ token }: { token: string }) {
   function removePeer(peerId: string) {
     peerConnectionsRef.current.get(peerId)?.close();
     peerConnectionsRef.current.delete(peerId);
+    makingOfferRef.current.delete(peerId);
+    ignoreOfferRef.current.delete(peerId);
+    queuedOfferRef.current.delete(peerId);
+    pendingCandidatesRef.current.delete(peerId);
     setPeers((current) => current.filter((peer) => peer.peerId !== peerId));
     setRemoteStreams((current) => {
       const next = new Map(current);
@@ -978,9 +1111,13 @@ function RoomPage({ token }: { token: string }) {
           playsInline
           preload="auto"
           onLoadedMetadata={onVideoLoaded}
+          onCanPlay={() => maybeSendBufferReady()}
           onPlay={() => sendSyncAction('play')}
           onPause={() => sendSyncAction('pause')}
-          onSeeked={() => sendSyncAction('seek')}
+          onSeeked={() => {
+            sendSyncAction('seek');
+            maybeSendBufferReady();
+          }}
         />
         <p className="hint">
           Любой участник может поставить паузу, продолжить просмотр, перемотать или выбрать серию. Это
@@ -1014,11 +1151,11 @@ function RoomPage({ token }: { token: string }) {
         </div>
         <div className="tiles">
           <MediaTile label="Вы" stream={localStream} muted />
-          {[...remoteStreams.entries()].map(([peerId, stream]) => (
+          {peers.map((peer) => (
             <MediaTile
-              key={peerId}
-              label={`Участник ${peerId.slice(0, 8)}`}
-              stream={stream}
+              key={peer.peerId}
+              label={`Участник ${peer.peerId.slice(0, 8)} · ${peerMediaLabel(peer)}`}
+              stream={remoteStreams.get(peer.peerId) ?? null}
               muted={false}
             />
           ))}
@@ -1159,6 +1296,13 @@ function upsertPeer(peers: PeerInfo[], peer: PeerInfo): PeerInfo[] {
   const index = peers.findIndex((item) => item.peerId === peer.peerId);
   if (index === -1) return [...peers, peer];
   return peers.map((item) => (item.peerId === peer.peerId ? peer : item));
+}
+
+function peerMediaLabel(peer: PeerInfo): string {
+  if (peer.video && peer.audio) return 'камера и микрофон';
+  if (peer.video) return 'камера';
+  if (peer.audio) return 'микрофон';
+  return 'без камеры';
 }
 
 function episodeNumbers(count: number): number[] {

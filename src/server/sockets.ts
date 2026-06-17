@@ -26,6 +26,15 @@ interface RuntimeRoom {
   token: string;
   state: WatchState;
   clients: Map<string, ClientConnection>;
+  bufferWait: BufferWait | null;
+}
+
+interface BufferWait {
+  id: string;
+  videoId: string;
+  positionSeconds: number;
+  requiredPeerIds: Set<string>;
+  readyPeerIds: Set<string>;
 }
 
 type ClientMessage =
@@ -33,7 +42,10 @@ type ClientMessage =
   | { type: 'sync-action'; action?: string; videoId?: string; position?: number; playing?: boolean }
   | { type: 'switch-video'; videoId?: string }
   | { type: 'signal'; targetPeerId?: string; data?: unknown }
-  | { type: 'media-state'; audio?: boolean; video?: boolean };
+  | { type: 'media-state'; audio?: boolean; video?: boolean }
+  | { type: 'buffer-ready'; waitId?: string };
+
+const seekBufferThresholdSeconds = 3;
 
 const rooms = new Map<string, RuntimeRoom>();
 
@@ -108,6 +120,7 @@ export async function registerWatchSockets(app: FastifyInstance, store: Store): 
       if (!runtimeRoom) return;
 
       if (message.type === 'sync-action') {
+        const previousBufferWaitId = runtimeRoom.bufferWait?.id ?? null;
         const changed = updateWatchState(runtimeRoom, store, message);
         if (changed) {
           app.log.debug(
@@ -121,12 +134,43 @@ export async function registerWatchSockets(app: FastifyInstance, store: Store): 
             },
             'watch state updated'
           );
+          if (runtimeRoom.bufferWait && runtimeRoom.bufferWait.id !== previousBufferWaitId) {
+            broadcast(runtimeRoom, {
+              type: 'buffer-wait',
+              sourcePeerId: peerId,
+              waitId: runtimeRoom.bufferWait.id,
+              serverNow: Date.now(),
+              state: runtimeRoom.state
+            });
+            return;
+          }
           broadcast(runtimeRoom, {
             type: 'sync-state',
             sourcePeerId: peerId,
             serverNow: Date.now(),
             state: runtimeRoom.state
           }, peerId);
+        }
+        return;
+      }
+
+      if (message.type === 'buffer-ready') {
+        const wait = runtimeRoom.bufferWait;
+        if (!wait || message.waitId !== wait.id || !wait.requiredPeerIds.has(peerId)) return;
+        wait.readyPeerIds.add(peerId);
+        app.log.debug(
+          {
+            token: roomToken,
+            peerId,
+            waitId: wait.id,
+            readyPeers: wait.readyPeerIds.size,
+            requiredPeers: wait.requiredPeerIds.size
+          },
+          'peer buffered seek target'
+        );
+        if (isBufferWaitReady(runtimeRoom)) {
+          finishBufferWait(runtimeRoom);
+          broadcast(runtimeRoom, { type: 'sync-state', serverNow: Date.now(), state: runtimeRoom.state });
         }
         return;
       }
@@ -138,6 +182,7 @@ export async function registerWatchSockets(app: FastifyInstance, store: Store): 
           return;
         }
 
+        clearBufferWait(runtimeRoom);
         store.updateRoomCurrentVideo(roomToken, nextVideo.id);
         runtimeRoom.state = {
           videoId: nextVideo.id,
@@ -187,8 +232,16 @@ export async function registerWatchSockets(app: FastifyInstance, store: Store): 
       const runtimeRoom = rooms.get(roomToken);
       if (!runtimeRoom) return;
       runtimeRoom.clients.delete(peerId);
+      if (runtimeRoom.bufferWait) {
+        runtimeRoom.bufferWait.requiredPeerIds.delete(peerId);
+        runtimeRoom.bufferWait.readyPeerIds.delete(peerId);
+      }
       app.log.info({ token: roomToken, peerId, peers: runtimeRoom.clients.size }, 'websocket peer left room');
       broadcast(runtimeRoom, { type: 'peer-left', peerId }, peerId);
+      if (isBufferWaitReady(runtimeRoom)) {
+        finishBufferWait(runtimeRoom);
+        broadcast(runtimeRoom, { type: 'sync-state', serverNow: Date.now(), state: runtimeRoom.state });
+      }
       if (runtimeRoom.clients.size === 0) rooms.delete(roomToken);
     });
   });
@@ -219,7 +272,8 @@ function getRuntimeRoom(token: string, videoId: string): RuntimeRoom {
       updatedAt: Date.now(),
       version: 0
     },
-    clients: new Map()
+    clients: new Map(),
+    bufferWait: null
   };
   rooms.set(token, room);
   return room;
@@ -239,6 +293,7 @@ function updateWatchState(room: RuntimeRoom, store: Store, message: ClientMessag
   const position = clampPosition(requestedPosition, currentVideo?.durationSeconds ?? null);
 
   if (action === 'play') {
+    clearBufferWait(room);
     room.state = {
       ...room.state,
       playing: true,
@@ -250,6 +305,7 @@ function updateWatchState(room: RuntimeRoom, store: Store, message: ClientMessag
   }
 
   if (action === 'pause') {
+    clearBufferWait(room);
     room.state = {
       ...room.state,
       playing: false,
@@ -261,6 +317,27 @@ function updateWatchState(room: RuntimeRoom, store: Store, message: ClientMessag
   }
 
   if (action === 'seek') {
+    clearBufferWait(room);
+    if (message.playing === true
+      && room.clients.size > 1
+      && Math.abs(position - currentPosition) >= seekBufferThresholdSeconds) {
+      room.bufferWait = {
+        id: randomUUID(),
+        videoId: room.state.videoId,
+        positionSeconds: position,
+        requiredPeerIds: new Set(room.clients.keys()),
+        readyPeerIds: new Set()
+      };
+      room.state = {
+        ...room.state,
+        playing: false,
+        positionSeconds: position,
+        updatedAt: now,
+        version: room.state.version + 1
+      };
+      return true;
+    }
+
     room.state = {
       ...room.state,
       playing: typeof message.playing === 'boolean' ? message.playing : room.state.playing,
@@ -272,6 +349,34 @@ function updateWatchState(room: RuntimeRoom, store: Store, message: ClientMessag
   }
 
   return false;
+}
+
+function clearBufferWait(room: RuntimeRoom): void {
+  room.bufferWait = null;
+}
+
+function isBufferWaitReady(room: RuntimeRoom): boolean {
+  const wait = room.bufferWait;
+  if (!wait) return false;
+  for (const peerId of wait.requiredPeerIds) {
+    if (!room.clients.has(peerId)) continue;
+    if (!wait.readyPeerIds.has(peerId)) return false;
+  }
+  return true;
+}
+
+function finishBufferWait(room: RuntimeRoom): void {
+  const wait = room.bufferWait;
+  if (!wait) return;
+  room.bufferWait = null;
+  room.state = {
+    ...room.state,
+    videoId: wait.videoId,
+    playing: true,
+    positionSeconds: wait.positionSeconds,
+    updatedAt: Date.now(),
+    version: room.state.version + 1
+  };
 }
 
 function findReadyVideo(store: Store, token: string, videoId: string): VideoRecord | null {
