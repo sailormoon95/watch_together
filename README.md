@@ -80,6 +80,12 @@ WATCH_SESSION_TTL_HOURS=24
 # Опционально для production: Node авторизует, Nginx отдает видео через X-Accel-Redirect.
 # WATCH_VIDEO_ACCEL_REDIRECT_PREFIX=/watch-internal-media/
 # WATCH_VIDEO_ACCEL_FILE_PREFIX=/data/media
+# Опционально для production WebRTC: TURN relay для строгих NAT/мобильных сетей.
+# WATCH_TURN_URLS=turn:plugin-ai.ru:3478?transport=udp,turn:plugin-ai.ru:3478?transport=tcp
+# WATCH_TURN_SHARED_SECRET=change-me-to-a-long-random-string
+# WATCH_TURN_CREDENTIAL_TTL_SECONDS=21600
+# WATCH_TURN_REALM=plugin-ai.ru
+# WATCH_TURN_EXTERNAL_IP=193.39.68.63
 ```
 
 ## Docker
@@ -129,6 +135,8 @@ location ^~ /watch-internal-media/ {
 ```
 
 Для длинной загрузки больших файлов может понадобиться увеличить proxy timeout/body size в текущем reverse proxy.
+
+Для WebRTC в реальном интернете нужен TURN: один STUN часто не соединяет участников за строгим NAT или мобильными сетями. В `docker-compose.yml` есть сервис `watch-turn` на `3478/tcp`, `3478/udp` и relay UDP range `49160-49200`.
 
 ## Хранение данных
 

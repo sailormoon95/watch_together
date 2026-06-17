@@ -43,7 +43,15 @@ type ClientMessage =
   | { type: 'switch-video'; videoId?: string }
   | { type: 'signal'; targetPeerId?: string; data?: unknown }
   | { type: 'media-state'; audio?: boolean; video?: boolean }
-  | { type: 'buffer-ready'; waitId?: string };
+  | { type: 'buffer-ready'; waitId?: string }
+  | {
+      type: 'rtc-state';
+      remotePeerId?: string;
+      event?: string;
+      connectionState?: string;
+      iceConnectionState?: string;
+      signalingState?: string;
+    };
 
 const seekBufferThresholdSeconds = 3;
 
@@ -204,6 +212,16 @@ export async function registerWatchSockets(app: FastifyInstance, store: Store): 
       if (message.type === 'signal') {
         const targetPeerId = typeof message.targetPeerId === 'string' ? message.targetPeerId : '';
         const target = runtimeRoom.clients.get(targetPeerId);
+        app.log.debug(
+          {
+            token: roomToken,
+            sourcePeerId: peerId,
+            targetPeerId,
+            signal: signalSummary(message.data),
+            delivered: Boolean(target)
+          },
+          'webrtc signal relayed'
+        );
         if (target) {
           send(target.socket, {
             type: 'signal',
@@ -211,6 +229,22 @@ export async function registerWatchSockets(app: FastifyInstance, store: Store): 
             data: message.data
           });
         }
+        return;
+      }
+
+      if (message.type === 'rtc-state') {
+        app.log.debug(
+          {
+            token: roomToken,
+            peerId,
+            remotePeerId: message.remotePeerId,
+            event: message.event,
+            connectionState: message.connectionState,
+            iceConnectionState: message.iceConnectionState,
+            signalingState: message.signalingState
+          },
+          'webrtc client state changed'
+        );
         return;
       }
 
@@ -404,6 +438,18 @@ function publicPeer(peer: PeerInfo): PeerInfo {
     audio: peer.audio,
     video: peer.video
   };
+}
+
+function signalSummary(data: unknown): string {
+  if (!data || typeof data !== 'object') return 'unknown';
+  const signal = data as { description?: { type?: unknown }; candidate?: { type?: unknown; protocol?: unknown } };
+  if (signal.description?.type) return `description:${String(signal.description.type)}`;
+  if (signal.candidate) {
+    const type = typeof signal.candidate.type === 'string' ? signal.candidate.type : 'candidate';
+    const protocol = typeof signal.candidate.protocol === 'string' ? signal.candidate.protocol : 'unknown';
+    return `candidate:${type}:${protocol}`;
+  }
+  return 'unknown';
 }
 
 function broadcast(room: RuntimeRoom, payload: unknown, exceptPeerId?: string): void {

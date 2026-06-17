@@ -52,6 +52,7 @@ interface RoomMeta {
   };
   currentVideoId: string;
   videos: RoomVideo[];
+  iceServers: RTCIceServer[];
 }
 
 interface PeerInfo {
@@ -614,6 +615,7 @@ function RoomPage({ token }: { token: string }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const iceServersRef = useRef<RTCIceServer[]>(defaultIceServers());
   const localStreamRef = useRef<MediaStream | null>(null);
   const myPeerIdRef = useRef('');
   const makingOfferRef = useRef<Map<string, boolean>>(new Map());
@@ -639,6 +641,7 @@ function RoomPage({ token }: { token: string }) {
         const roomMeta = await apiJson<RoomMeta>(`${apiBase}/rooms/${encodeURIComponent(token)}`);
         if (stopped) return;
         setRoom(roomMeta);
+        iceServersRef.current = roomMeta.iceServers.length > 0 ? roomMeta.iceServers : defaultIceServers();
         setSelectedVideoId(roomMeta.currentVideoId);
         selectedVideoIdRef.current = roomMeta.currentVideoId;
         connectSocket();
@@ -866,10 +869,7 @@ function RoomPage({ token }: { token: string }) {
     if (existing) peerConnectionsRef.current.delete(peerId);
 
     const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun.cloudflare.com:3478' }
-      ]
+      iceServers: iceServersRef.current
     });
 
     peerConnectionsRef.current.set(peerId, pc);
@@ -886,6 +886,7 @@ function RoomPage({ token }: { token: string }) {
 
     pc.ontrack = (event) => {
       const stream = event.streams[0] ?? new MediaStream([event.track]);
+      sendRtcState(peerId, 'track');
       setRemoteStreams((current) => {
         const next = new Map(current);
         next.set(peerId, stream);
@@ -894,15 +895,18 @@ function RoomPage({ token }: { token: string }) {
     };
 
     pc.onsignalingstatechange = () => {
+      sendRtcState(peerId, 'signaling');
       if (pc.signalingState !== 'stable' || !queuedOfferRef.current.delete(peerId)) return;
       void createOffer(peerId);
     };
 
     pc.oniceconnectionstatechange = () => {
+      sendRtcState(peerId, 'ice');
       if (pc.iceConnectionState === 'failed') void createOffer(peerId, true);
     };
 
     pc.onconnectionstatechange = () => {
+      sendRtcState(peerId, 'connection');
       if (pc.connectionState === 'failed') void createOffer(peerId, true);
     };
 
@@ -991,6 +995,19 @@ function RoomPage({ token }: { token: string }) {
   function queuePendingCandidate(peerId: string, candidate: RTCIceCandidateInit) {
     const candidates = pendingCandidatesRef.current.get(peerId) ?? [];
     pendingCandidatesRef.current.set(peerId, [...candidates, candidate]);
+  }
+
+  function sendRtcState(peerId: string, event: string) {
+    const pc = peerConnectionsRef.current.get(peerId);
+    if (!pc) return;
+    sendWs({
+      type: 'rtc-state',
+      remotePeerId: peerId,
+      event,
+      connectionState: pc.connectionState,
+      iceConnectionState: pc.iceConnectionState,
+      signalingState: pc.signalingState
+    });
   }
 
   function isPolitePeer(peerId: string): boolean {
@@ -1282,6 +1299,10 @@ function getErrorMessage(error: unknown): string {
 function watchSocketUrl(): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${protocol}//${window.location.host}/watch/ws`;
+}
+
+function defaultIceServers(): RTCIceServer[] {
+  return [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }];
 }
 
 function estimateTargetPosition(state: WatchState, serverOffset: number, duration: number): number {

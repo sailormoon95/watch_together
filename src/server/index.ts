@@ -3,7 +3,7 @@ import { mkdir, readFile, rename, rm, stat, statfs } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import cookiePlugin from '@fastify/cookie';
 import multipartPlugin from '@fastify/multipart';
@@ -28,6 +28,12 @@ interface UploadedTempFile {
   originalName: string;
   tempPath: string;
   sizeBytes: number;
+}
+
+interface PublicIceServer {
+  urls: string | string[];
+  username?: string;
+  credential?: string;
 }
 
 const adminCookieName = 'watch_admin_session';
@@ -352,7 +358,8 @@ app.get('/watch/api/rooms/:token', async (request, reply) => {
       title: room.item.title
     },
     currentVideoId: currentVideo.id,
-    videos: readyVideos.map(publicRoomVideo)
+    videos: readyVideos.map(publicRoomVideo),
+    iceServers: publicIceServers()
   };
 });
 
@@ -629,6 +636,23 @@ function safeEquals(left: string, right: string): boolean {
   const leftHash = createHash('sha256').update(left).digest();
   const rightHash = createHash('sha256').update(right).digest();
   return timingSafeEqual(leftHash, rightHash);
+}
+
+function publicIceServers(): PublicIceServer[] {
+  const iceServers: PublicIceServer[] = [
+    { urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }
+  ];
+
+  if (appConfig.turnUrls.length > 0 && appConfig.turnSharedSecret) {
+    const expiresAt = Math.floor(Date.now() / 1000) + appConfig.turnCredentialTtlSeconds;
+    const username = `${expiresAt}:watch`;
+    const credential = createHmac('sha1', appConfig.turnSharedSecret)
+      .update(username)
+      .digest('base64');
+    iceServers.push({ urls: appConfig.turnUrls, username, credential });
+  }
+
+  return iceServers;
 }
 
 function normalizeTitle(value: string | undefined): string {

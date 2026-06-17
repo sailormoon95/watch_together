@@ -21,6 +21,13 @@ function normalizeBaseUrl(raw: string): string {
   return raw.replace(/\/+$/, '');
 }
 
+function readList(name: string): string[] {
+  return (process.env[name] ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
 const dataDir = path.resolve(process.env.WATCH_DATA_DIR ?? './data');
 const mediaDir = path.join(dataDir, 'media');
 const publicBaseUrl = normalizeBaseUrl(
@@ -42,7 +49,10 @@ export const appConfig = {
   incomingDir: path.join(dataDir, 'incoming'),
   storePath: path.join(dataDir, 'store.json'),
   videoAccelRedirectPrefix: process.env.WATCH_VIDEO_ACCEL_REDIRECT_PREFIX ?? '',
-  videoAccelFilePrefix: path.resolve(process.env.WATCH_VIDEO_ACCEL_FILE_PREFIX ?? mediaDir)
+  videoAccelFilePrefix: path.resolve(process.env.WATCH_VIDEO_ACCEL_FILE_PREFIX ?? mediaDir),
+  turnUrls: readList('WATCH_TURN_URLS'),
+  turnSharedSecret: process.env.WATCH_TURN_SHARED_SECRET ?? '',
+  turnCredentialTtlSeconds: readInt('WATCH_TURN_CREDENTIAL_TTL_SECONDS', 6 * 60 * 60)
 };
 
 export async function ensureDataDirectories(): Promise<void> {
