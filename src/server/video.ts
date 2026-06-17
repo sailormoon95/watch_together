@@ -71,8 +71,24 @@ export async function processVideo(store: Store, videoId: string): Promise<void>
             '0:v:0',
             '-map',
             '0:a:0?',
-            '-c',
+            '-map',
+            '-0:d?',
+            '-map',
+            '-0:s?',
+            '-sn',
+            '-dn',
+            '-map_metadata',
+            '-1',
+            '-map_chapters',
+            '-1',
+            '-c:v',
             'copy',
+            '-c:a',
+            'aac',
+            '-ac',
+            '2',
+            '-b:a',
+            '160k',
             '-movflags',
             '+faststart',
             outputPath
@@ -85,6 +101,16 @@ export async function processVideo(store: Store, videoId: string): Promise<void>
             '0:v:0',
             '-map',
             '0:a:0?',
+            '-map',
+            '-0:d?',
+            '-map',
+            '-0:s?',
+            '-sn',
+            '-dn',
+            '-map_metadata',
+            '-1',
+            '-map_chapters',
+            '-1',
             '-c:v',
             'libx264',
             '-preset',
@@ -95,6 +121,8 @@ export async function processVideo(store: Store, videoId: string): Promise<void>
             'yuv420p',
             '-c:a',
             'aac',
+            '-ac',
+            '2',
             '-b:a',
             '160k',
             '-movflags',
@@ -127,6 +155,7 @@ export async function sendVideoFile(
 
   reply.header('Accept-Ranges', 'bytes');
   reply.header('Content-Type', mimeType);
+  reply.header('Cache-Control', 'no-store');
 
   if (!range) {
     reply.header('Content-Length', fileStat.size);
