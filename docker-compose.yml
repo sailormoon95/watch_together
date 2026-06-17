@@ -48,14 +48,24 @@ services:
           tcp_port: 7881
           port_range_start: 50000
           port_range_end: 50100
-          use_external_ip: true
+          use_external_ip: false
+          node_ip: ${LIVEKIT_NODE_IP:-193.39.68.63}
+          interfaces:
+            includes:
+              - ens3
         turn:
           enabled: true
           udp_port: 3478
+          tls_port: 5349
+          domain: ${LIVEKIT_TURN_DOMAIN:-plugin-ai.ru}
+          cert_file: /etc/letsencrypt/live/plugin-ai.ru/fullchain.pem
+          key_file: /etc/letsencrypt/live/plugin-ai.ru/privkey.pem
           relay_range_start: 50200
           relay_range_end: 50220
         keys:
           ${LIVEKIT_API_KEY:-devkey}: "${LIVEKIT_API_SECRET:-secret}"
+    volumes:
+      - /etc/letsencrypt:/etc/letsencrypt:ro
     logging:
       driver: json-file
       options:

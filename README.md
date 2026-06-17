@@ -95,7 +95,7 @@ docker compose up -d
 ```
 
 По умолчанию контейнер приложения слушает локально на `127.0.0.1:3012`, чтобы reverse proxy отдавал приложение под `https://plugin-ai.ru/watch`.
-LiveKit запускается в `network_mode: host`, чтобы не создавать сотни Docker UDP proxy. Signaling слушает локально на `127.0.0.1:7880`, а media ports открываются напрямую: `7881/tcp`, `50000-50100/udp`, TURN/UDP `3478/udp` и relay range `50200-50220/udp`.
+LiveKit запускается в `network_mode: host`, чтобы не создавать сотни Docker UDP proxy. Signaling слушает `7880`, media ports открываются напрямую: `7881/tcp`, `50000-50100/udp`, TURN/UDP `3478/udp`, TURN/TLS `5349/tcp` и relay range `50200-50220/udp`. В конфиге LiveKit нужно рекламировать только публичный IP, а не Docker bridge interfaces.
 
 ## Reverse Proxy
 
@@ -146,7 +146,7 @@ location ^~ /watch-internal-media/ {
 ```
 
 Для длинной загрузки больших файлов может понадобиться увеличить proxy timeout/body size в текущем reverse proxy.
-Для LiveKit нужно открыть на сервере `7881/tcp`, `3478/udp`, `50000-50100/udp` и `50200-50220/udp`, иначе камеры/микрофоны не смогут передавать media traffic в некоторых сетях.
+Для LiveKit нужно открыть на сервере `7881/tcp`, `5349/tcp`, `3478/udp`, `50000-50100/udp` и `50200-50220/udp`, иначе камеры/микрофоны не смогут передавать media traffic в некоторых сетях.
 
 ## Хранение данных
 
