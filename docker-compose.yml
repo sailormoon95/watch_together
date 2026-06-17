@@ -38,7 +38,7 @@ services:
     image: livekit/livekit-server:latest
     container_name: watch-livekit
     restart: unless-stopped
-    command: --bind 0.0.0.0
+    network_mode: host
     environment:
       LIVEKIT_CONFIG: |
         port: 7880
@@ -53,15 +53,9 @@ services:
           enabled: true
           udp_port: 3478
           relay_range_start: 50200
-          relay_range_end: 50300
+          relay_range_end: 50220
         keys:
           ${LIVEKIT_API_KEY:-devkey}: "${LIVEKIT_API_SECRET:-secret}"
-    ports:
-      - "127.0.0.1:7880:7880"
-      - "7881:7881/tcp"
-      - "3478:3478/udp"
-      - "50000-50100:50000-50100/udp"
-      - "50200-50300:50200-50300/udp"
     logging:
       driver: json-file
       options:
