@@ -12,13 +12,8 @@ interface WatchState {
   version: number;
 }
 
-interface PeerInfo {
+interface ClientConnection {
   peerId: string;
-  audio: boolean;
-  video: boolean;
-}
-
-interface ClientConnection extends PeerInfo {
   socket: WebSocket;
 }
 
@@ -41,17 +36,7 @@ type ClientMessage =
   | { type: 'join'; token?: string }
   | { type: 'sync-action'; action?: string; videoId?: string; position?: number; playing?: boolean }
   | { type: 'switch-video'; videoId?: string }
-  | { type: 'signal'; targetPeerId?: string; data?: unknown }
-  | { type: 'media-state'; audio?: boolean; video?: boolean }
-  | { type: 'buffer-ready'; waitId?: string }
-  | {
-      type: 'rtc-state';
-      remotePeerId?: string;
-      event?: string;
-      connectionState?: string;
-      iceConnectionState?: string;
-      signalingState?: string;
-    };
+  | { type: 'buffer-ready'; waitId?: string };
 
 const seekBufferThresholdSeconds = 3;
 
@@ -92,7 +77,7 @@ export async function registerWatchSockets(app: FastifyInstance, store: Store): 
         peerId = randomUUID();
         roomToken = token;
 
-        const client: ClientConnection = { peerId, socket, audio: false, video: false };
+        const client: ClientConnection = { peerId, socket };
         runtimeRoom.clients.set(peerId, client);
 
         app.log.info(
@@ -109,13 +94,8 @@ export async function registerWatchSockets(app: FastifyInstance, store: Store): 
           type: 'joined',
           peerId,
           serverNow: Date.now(),
-          state: runtimeRoom.state,
-          peers: [...runtimeRoom.clients.values()]
-            .filter((peer) => peer.peerId !== peerId)
-            .map(publicPeer)
+          state: runtimeRoom.state
         });
-
-        broadcast(runtimeRoom, { type: 'peer-joined', peer: publicPeer(client) }, peerId);
         return;
       }
 
@@ -209,56 +189,6 @@ export async function registerWatchSockets(app: FastifyInstance, store: Store): 
         return;
       }
 
-      if (message.type === 'signal') {
-        const targetPeerId = typeof message.targetPeerId === 'string' ? message.targetPeerId : '';
-        const target = runtimeRoom.clients.get(targetPeerId);
-        app.log.debug(
-          {
-            token: roomToken,
-            sourcePeerId: peerId,
-            targetPeerId,
-            signal: signalSummary(message.data),
-            delivered: Boolean(target)
-          },
-          'webrtc signal relayed'
-        );
-        if (target) {
-          send(target.socket, {
-            type: 'signal',
-            sourcePeerId: peerId,
-            data: message.data
-          });
-        }
-        return;
-      }
-
-      if (message.type === 'rtc-state') {
-        app.log.debug(
-          {
-            token: roomToken,
-            peerId,
-            remotePeerId: message.remotePeerId,
-            event: message.event,
-            connectionState: message.connectionState,
-            iceConnectionState: message.iceConnectionState,
-            signalingState: message.signalingState
-          },
-          'webrtc client state changed'
-        );
-        return;
-      }
-
-      if (message.type === 'media-state') {
-        const client = runtimeRoom.clients.get(peerId);
-        if (!client) return;
-        client.audio = Boolean(message.audio);
-        client.video = Boolean(message.video);
-        app.log.debug(
-          { token: roomToken, peerId, audio: client.audio, video: client.video },
-          'peer media state changed'
-        );
-        broadcast(runtimeRoom, { type: 'media-state', peer: publicPeer(client) }, peerId);
-      }
     });
 
     socket.on('close', () => {
@@ -271,7 +201,6 @@ export async function registerWatchSockets(app: FastifyInstance, store: Store): 
         runtimeRoom.bufferWait.readyPeerIds.delete(peerId);
       }
       app.log.info({ token: roomToken, peerId, peers: runtimeRoom.clients.size }, 'websocket peer left room');
-      broadcast(runtimeRoom, { type: 'peer-left', peerId }, peerId);
       if (isBufferWaitReady(runtimeRoom)) {
         finishBufferWait(runtimeRoom);
         broadcast(runtimeRoom, { type: 'sync-state', serverNow: Date.now(), state: runtimeRoom.state });
@@ -430,38 +359,6 @@ function getCurrentPosition(state: WatchState, now: number): number {
 function clampPosition(position: number, durationSeconds: number | null): number {
   const max = durationSeconds && durationSeconds > 0 ? durationSeconds : Number.POSITIVE_INFINITY;
   return Math.max(0, Math.min(position, max));
-}
-
-function publicPeer(peer: PeerInfo): PeerInfo {
-  return {
-    peerId: peer.peerId,
-    audio: peer.audio,
-    video: peer.video
-  };
-}
-
-function signalSummary(data: unknown): string {
-  if (!data || typeof data !== 'object') return 'unknown';
-  const signal = data as {
-    description?: { type?: unknown };
-    candidate?: { candidate?: unknown; type?: unknown; protocol?: unknown };
-  };
-  if (signal.description?.type) return `description:${String(signal.description.type)}`;
-  if (signal.candidate) {
-    const rawCandidate = typeof signal.candidate.candidate === 'string' ? signal.candidate.candidate : '';
-    const type = typeof signal.candidate.type === 'string'
-      ? signal.candidate.type
-      : / typ ([a-z]+)/.exec(rawCandidate)?.[1] ?? 'candidate';
-    const protocol = typeof signal.candidate.protocol === 'string'
-      ? signal.candidate.protocol
-      : / udp /i.test(rawCandidate)
-        ? 'udp'
-        : / tcp /i.test(rawCandidate)
-          ? 'tcp'
-          : 'unknown';
-    return `candidate:${type}:${protocol}`;
-  }
-  return 'unknown';
 }
 
 function broadcast(room: RuntimeRoom, payload: unknown, exceptPeerId?: string): void {

@@ -3,11 +3,12 @@ import { mkdir, readFile, rename, rm, stat, statfs } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
-import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import cookiePlugin from '@fastify/cookie';
 import multipartPlugin from '@fastify/multipart';
 import staticPlugin from '@fastify/static';
+import { AccessToken } from 'livekit-server-sdk';
 import { appConfig, ensureDataDirectories } from './config.js';
 import {
   Store,
@@ -28,12 +29,6 @@ interface UploadedTempFile {
   originalName: string;
   tempPath: string;
   sizeBytes: number;
-}
-
-interface PublicIceServer {
-  urls: string | string[];
-  username?: string;
-  credential?: string;
 }
 
 const adminCookieName = 'watch_admin_session';
@@ -358,8 +353,47 @@ app.get('/watch/api/rooms/:token', async (request, reply) => {
       title: room.item.title
     },
     currentVideoId: currentVideo.id,
-    videos: readyVideos.map(publicRoomVideo),
-    iceServers: publicIceServers()
+    videos: readyVideos.map(publicRoomVideo)
+  };
+});
+
+app.get('/watch/api/rooms/:token/livekit-token', async (request, reply) => {
+  const token = getTokenParam(request);
+  const room = store.getRoomWithItem(token);
+  const readyVideos = room?.videos.filter((video) => video.status === 'ready') ?? [];
+  const currentVideo = getCurrentReadyVideo(room?.currentVideoId ?? '', readyVideos);
+  if (!room || !currentVideo) {
+    app.log.warn({ token }, 'livekit token request rejected');
+    reply.code(404);
+    return { error: 'Комната не найдена' };
+  }
+
+  if (!appConfig.liveKitUrl || !appConfig.liveKitApiKey || !appConfig.liveKitApiSecret) {
+    app.log.error({ token }, 'livekit token request failed because LiveKit is not configured');
+    reply.code(503);
+    return { error: 'LiveKit не настроен на сервере' };
+  }
+
+  const identity = `viewer-${randomToken(9)}`;
+  const name = `Участник ${identity.slice(-4).toUpperCase()}`;
+  const accessToken = new AccessToken(appConfig.liveKitApiKey, appConfig.liveKitApiSecret, {
+    identity,
+    name,
+    ttl: 6 * 60 * 60
+  });
+  accessToken.addGrant({
+    roomJoin: true,
+    room: liveKitRoomName(room.token),
+    canPublish: true,
+    canSubscribe: true,
+    canPublishData: false
+  });
+
+  return {
+    url: appConfig.liveKitUrl,
+    token: await accessToken.toJwt(),
+    identity,
+    name
   };
 });
 
@@ -576,6 +610,10 @@ function publicRoomVideo(video: VideoRecord): Pick<
   };
 }
 
+function getCurrentReadyVideo(videoId: string, videos: VideoRecord[]): VideoRecord | null {
+  return videos.find((video) => video.id === videoId) ?? videos[0] ?? null;
+}
+
 async function registerClientRoutes(fastify: typeof app): Promise<void> {
   const currentFile = fileURLToPath(import.meta.url);
   const currentDir = path.dirname(currentFile);
@@ -638,21 +676,8 @@ function safeEquals(left: string, right: string): boolean {
   return timingSafeEqual(leftHash, rightHash);
 }
 
-function publicIceServers(): PublicIceServer[] {
-  const iceServers: PublicIceServer[] = [
-    { urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }
-  ];
-
-  if (appConfig.turnUrls.length > 0 && appConfig.turnSharedSecret) {
-    const expiresAt = Math.floor(Date.now() / 1000) + appConfig.turnCredentialTtlSeconds;
-    const username = `${expiresAt}:watch`;
-    const credential = createHmac('sha1', appConfig.turnSharedSecret)
-      .update(username)
-      .digest('base64');
-    iceServers.push({ urls: appConfig.turnUrls, username, credential });
-  }
-
-  return iceServers;
+function liveKitRoomName(token: string): string {
+  return `watch-${token}`;
 }
 
 function normalizeTitle(value: string | undefined): string {

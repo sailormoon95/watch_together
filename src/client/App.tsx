@@ -1,4 +1,12 @@
 import { FormEvent, useEffect, useRef, useState } from 'react';
+import {
+  Room,
+  RoomEvent,
+  Track,
+  type LocalTrackPublication,
+  type Participant,
+  type TrackPublication
+} from 'livekit-client';
 
 const apiBase = '/watch/api';
 
@@ -52,13 +60,13 @@ interface RoomMeta {
   };
   currentVideoId: string;
   videos: RoomVideo[];
-  iceServers: RTCIceServer[];
 }
 
-interface PeerInfo {
-  peerId: string;
-  audio: boolean;
-  video: boolean;
+interface LiveKitTokenResponse {
+  url: string;
+  token: string;
+  identity: string;
+  name: string;
 }
 
 interface WatchState {
@@ -70,24 +78,26 @@ interface WatchState {
 }
 
 type ServerMessage =
-  | { type: 'joined'; peerId: string; serverNow: number; state: WatchState; peers: PeerInfo[] }
-  | { type: 'peer-joined'; peer: PeerInfo }
-  | { type: 'peer-left'; peerId: string }
+  | { type: 'joined'; peerId?: string; serverNow: number; state: WatchState }
   | { type: 'sync-state'; serverNow: number; state: WatchState; sourcePeerId?: string }
   | { type: 'buffer-wait'; waitId: string; serverNow: number; state: WatchState; sourcePeerId?: string }
   | { type: 'video-switched'; serverNow: number; state: WatchState; sourcePeerId?: string }
-  | { type: 'signal'; sourcePeerId: string; data: SignalData }
-  | { type: 'media-state'; peer: PeerInfo }
   | { type: 'error'; message: string };
 
-interface SignalData {
-  description?: RTCSessionDescriptionInit;
-  candidate?: RTCIceCandidateInit;
+interface LocalMediaState {
+  microphone: boolean;
+  muted: boolean;
+  camera: boolean;
 }
 
-interface LocalMediaState {
+interface ParticipantTileData {
+  identity: string;
+  label: string;
+  stream: MediaStream | null;
   audio: boolean;
+  muted: boolean;
   video: boolean;
+  local: boolean;
 }
 
 interface BufferWaitState {
@@ -606,28 +616,23 @@ function RoomPage({ token }: { token: string }) {
   const [selectedVideoId, setSelectedVideoId] = useState('');
   const [error, setError] = useState('');
   const [status, setStatus] = useState('Подключаюсь...');
-  const [peers, setPeers] = useState<PeerInfo[]>([]);
-  const [remoteStreams, setRemoteStreams] = useState<Map<string, MediaStream>>(new Map());
-  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
-  const [localMedia, setLocalMedia] = useState<LocalMediaState>({ audio: false, video: false });
-  const [myPeerId, setMyPeerId] = useState('');
+  const [callStatus, setCallStatus] = useState('Камеры подключаются...');
+  const [participants, setParticipants] = useState<ParticipantTileData[]>([]);
+  const [localMedia, setLocalMedia] = useState<LocalMediaState>({ microphone: false, muted: false, camera: false });
+  const [liveKitIdentity, setLiveKitIdentity] = useState('');
+  const [stageFullscreen, setStageFullscreen] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
-  const iceServersRef = useRef<RTCIceServer[]>(defaultIceServers());
-  const localStreamRef = useRef<MediaStream | null>(null);
-  const myPeerIdRef = useRef('');
-  const makingOfferRef = useRef<Map<string, boolean>>(new Map());
-  const ignoreOfferRef = useRef<Map<string, boolean>>(new Map());
-  const queuedOfferRef = useRef<Set<string>>(new Set());
-  const pendingCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
+  const liveKitRoomRef = useRef<Room | null>(null);
   const serverOffsetRef = useRef(0);
   const lastStateRef = useRef<WatchState | null>(null);
   const pendingStateRef = useRef<WatchState | null>(null);
   const pendingBufferWaitRef = useRef<BufferWaitState | null>(null);
   const selectedVideoIdRef = useRef('');
   const suppressEventsRef = useRef(false);
+  const switchingNativeFullscreenRef = useRef(false);
 
   useEffect(() => {
     selectedVideoIdRef.current = selectedVideoId;
@@ -641,10 +646,10 @@ function RoomPage({ token }: { token: string }) {
         const roomMeta = await apiJson<RoomMeta>(`${apiBase}/rooms/${encodeURIComponent(token)}`);
         if (stopped) return;
         setRoom(roomMeta);
-        iceServersRef.current = roomMeta.iceServers.length > 0 ? roomMeta.iceServers : defaultIceServers();
         setSelectedVideoId(roomMeta.currentVideoId);
         selectedVideoIdRef.current = roomMeta.currentVideoId;
         connectSocket();
+        void connectLiveKit(() => stopped);
       } catch (err) {
         setError(getErrorMessage(err));
         setStatus('Ошибка');
@@ -656,15 +661,34 @@ function RoomPage({ token }: { token: string }) {
     return () => {
       stopped = true;
       wsRef.current?.close();
-      for (const pc of peerConnectionsRef.current.values()) pc.close();
-      peerConnectionsRef.current.clear();
-      makingOfferRef.current.clear();
-      ignoreOfferRef.current.clear();
-      queuedOfferRef.current.clear();
-      pendingCandidatesRef.current.clear();
-      localStreamRef.current?.getTracks().forEach((track) => track.stop());
+      void liveKitRoomRef.current?.disconnect(true);
+      liveKitRoomRef.current = null;
     };
   }, [token]);
+
+  useEffect(() => {
+    const onFullscreenChange = () => {
+      const fullscreenElement = document.fullscreenElement;
+      const stage = stageRef.current;
+      const video = videoRef.current;
+
+      if (fullscreenElement === video && stage && !switchingNativeFullscreenRef.current) {
+        switchingNativeFullscreenRef.current = true;
+        void document.exitFullscreen()
+          .then(() => stage.requestFullscreen())
+          .catch(() => undefined)
+          .finally(() => {
+            switchingNativeFullscreenRef.current = false;
+          });
+        return;
+      }
+
+      setStageFullscreen(fullscreenElement === stage);
+    };
+
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
+  }, []);
 
   useEffect(() => {
     const interval = window.setInterval(() => {
@@ -712,6 +736,60 @@ function RoomPage({ token }: { token: string }) {
     });
   }
 
+  async function connectLiveKit(isStopped: () => boolean) {
+    try {
+      setCallStatus('Камеры подключаются...');
+      const credentials = await apiJson<LiveKitTokenResponse>(
+        `${apiBase}/rooms/${encodeURIComponent(token)}/livekit-token`
+      );
+      if (isStopped()) return;
+
+      const liveKitRoom = new Room();
+      liveKitRoomRef.current = liveKitRoom;
+
+      const refreshParticipants = () => {
+        if (isStopped()) return;
+        updateLiveKitParticipants(liveKitRoom);
+      };
+
+      liveKitRoom.on(RoomEvent.ParticipantConnected, refreshParticipants);
+      liveKitRoom.on(RoomEvent.ParticipantDisconnected, refreshParticipants);
+      liveKitRoom.on(RoomEvent.TrackSubscribed, refreshParticipants);
+      liveKitRoom.on(RoomEvent.TrackUnsubscribed, refreshParticipants);
+      liveKitRoom.on(RoomEvent.TrackMuted, refreshParticipants);
+      liveKitRoom.on(RoomEvent.TrackUnmuted, refreshParticipants);
+      liveKitRoom.on(RoomEvent.LocalTrackPublished, refreshParticipants);
+      liveKitRoom.on(RoomEvent.LocalTrackUnpublished, refreshParticipants);
+      liveKitRoom.on(RoomEvent.Reconnecting, () => {
+        if (!isStopped()) setCallStatus('Камеры переподключаются...');
+      });
+      liveKitRoom.on(RoomEvent.Reconnected, () => {
+        if (isStopped()) return;
+        setCallStatus('Камеры онлайн');
+        refreshParticipants();
+      });
+      liveKitRoom.on(RoomEvent.Disconnected, () => {
+        if (isStopped()) return;
+        setCallStatus('Камеры отключены');
+        refreshParticipants();
+      });
+
+      await liveKitRoom.connect(credentials.url, credentials.token, { autoSubscribe: true });
+      if (isStopped()) {
+        await liveKitRoom.disconnect(true);
+        return;
+      }
+
+      setCallStatus('Камеры онлайн');
+      refreshParticipants();
+      void liveKitRoom.startAudio().catch(() => undefined);
+    } catch (err) {
+      if (isStopped()) return;
+      setCallStatus('Камеры недоступны');
+      setError(`Не удалось подключить камеры через LiveKit: ${getErrorMessage(err)}`);
+    }
+  }
+
   function handleServerMessage(message: ServerMessage) {
     if (message.type === 'error') {
       setError(message.message);
@@ -721,33 +799,8 @@ function RoomPage({ token }: { token: string }) {
     if ('serverNow' in message) serverOffsetRef.current = message.serverNow - Date.now();
 
     if (message.type === 'joined') {
-      myPeerIdRef.current = message.peerId;
-      setMyPeerId(message.peerId);
-      setPeers(message.peers);
-      for (const peer of message.peers) ensurePeerConnection(peer.peerId);
-      if (localStreamRef.current) {
-        for (const peer of message.peers) requestNegotiation(peer.peerId);
-      }
       lastStateRef.current = message.state;
       queueApplyState(message.state);
-      return;
-    }
-
-    if (message.type === 'peer-joined') {
-      setPeers((current) => upsertPeer(current, message.peer));
-      ensurePeerConnection(message.peer.peerId);
-      if (localStreamRef.current) requestNegotiation(message.peer.peerId);
-      return;
-    }
-
-    if (message.type === 'peer-left') {
-      removePeer(message.peerId);
-      return;
-    }
-
-    if (message.type === 'media-state') {
-      setPeers((current) => upsertPeer(current, message.peer));
-      requestNegotiation(message.peer.peerId);
       return;
     }
 
@@ -779,9 +832,6 @@ function RoomPage({ token }: { token: string }) {
       return;
     }
 
-    if (message.type === 'signal') {
-      void handleSignal(message.sourcePeerId, message.data);
-    }
   }
 
   function queueApplyState(state: WatchState) {
@@ -864,231 +914,87 @@ function RoomPage({ token }: { token: string }) {
     sendWs({ type: 'switch-video', videoId });
   }
 
-  function ensurePeerConnection(peerId: string): RTCPeerConnection {
-    const existing = peerConnectionsRef.current.get(peerId);
-    if (existing && existing.connectionState !== 'closed') return existing;
-    if (existing) peerConnectionsRef.current.delete(peerId);
-
-    const pc = new RTCPeerConnection({
-      iceServers: iceServersRef.current,
-      iceTransportPolicy: hasTurnIceServer(iceServersRef.current) ? 'relay' : 'all'
-    });
-
-    peerConnectionsRef.current.set(peerId, pc);
-    syncLocalTracks(pc);
-
-    pc.onicecandidate = (event) => {
-      if (!event.candidate) return;
-      sendWs({
-        type: 'signal',
-        targetPeerId: peerId,
-        data: { candidate: event.candidate.toJSON() }
-      });
-    };
-
-    pc.ontrack = (event) => {
-      const stream = event.streams[0] ?? new MediaStream([event.track]);
-      sendRtcState(peerId, 'track');
-      setRemoteStreams((current) => {
-        const next = new Map(current);
-        next.set(peerId, stream);
-        return next;
-      });
-    };
-
-    pc.onsignalingstatechange = () => {
-      sendRtcState(peerId, 'signaling');
-      if (pc.signalingState !== 'stable' || !queuedOfferRef.current.delete(peerId)) return;
-      requestNegotiation(peerId);
-    };
-
-    pc.oniceconnectionstatechange = () => {
-      sendRtcState(peerId, 'ice');
-    };
-
-    pc.onconnectionstatechange = () => {
-      sendRtcState(peerId, 'connection');
-      if (pc.connectionState === 'failed') setStatus('Связь камер не установилась, обновите комнату');
-    };
-
-    return pc;
-  }
-
-  async function handleSignal(peerId: string, data: SignalData) {
-    const pc = ensurePeerConnection(peerId);
-
-    try {
-      if (data.description) {
-        const description = new RTCSessionDescription(data.description);
-        const offerCollision = description.type === 'offer'
-          && (makingOfferRef.current.get(peerId) || pc.signalingState !== 'stable');
-        const ignoreOffer = !isPolitePeer(peerId) && offerCollision;
-        ignoreOfferRef.current.set(peerId, ignoreOffer);
-        if (ignoreOffer) return;
-
-        if (offerCollision) await pc.setLocalDescription({ type: 'rollback' });
-
-        await pc.setRemoteDescription(description);
-        await flushPendingCandidates(peerId, pc);
-
-        if (description.type === 'offer') {
-          syncLocalTracks(pc);
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          sendWs({
-            type: 'signal',
-            targetPeerId: peerId,
-            data: { description: pc.localDescription }
-          });
-        }
-        return;
-      }
-
-      if (data.candidate) {
-        if (ignoreOfferRef.current.get(peerId)) return;
-        if (!pc.remoteDescription) {
-          queuePendingCandidate(peerId, data.candidate);
-          return;
-        }
-        await addIceCandidate(pc, data.candidate);
-      }
-    } catch (err) {
-      console.warn('Failed to handle WebRTC signal', err);
-    }
-  }
-
-  async function createOffer(peerId: string, iceRestart = false) {
-    if (!shouldCreateOffer(peerId)) return;
-    const pc = ensurePeerConnection(peerId);
-    if (pc.signalingState !== 'stable') {
-      queuedOfferRef.current.add(peerId);
+  async function toggleMicrophoneConnection() {
+    const liveKitRoom = liveKitRoomRef.current;
+    if (!liveKitRoom) {
+      setError('Камеры еще не подключены');
       return;
     }
 
-    try {
-      makingOfferRef.current.set(peerId, true);
-      syncLocalTracks(pc);
-      const offer = await pc.createOffer({ iceRestart });
-      await pc.setLocalDescription(offer);
-      sendWs({
-        type: 'signal',
-        targetPeerId: peerId,
-        data: { description: pc.localDescription }
-      });
-    } catch (err) {
-      console.warn('Failed to create WebRTC offer', err);
-    } finally {
-      makingOfferRef.current.set(peerId, false);
-    }
-  }
-
-  async function flushPendingCandidates(peerId: string, pc: RTCPeerConnection) {
-    const candidates = pendingCandidatesRef.current.get(peerId) ?? [];
-    pendingCandidatesRef.current.delete(peerId);
-    for (const candidate of candidates) await addIceCandidate(pc, candidate);
-  }
-
-  async function addIceCandidate(pc: RTCPeerConnection, candidate: RTCIceCandidateInit) {
-    await pc.addIceCandidate(new RTCIceCandidate(candidate)).catch((err) => {
-      console.warn('Failed to add ICE candidate', err);
-    });
-  }
-
-  function queuePendingCandidate(peerId: string, candidate: RTCIceCandidateInit) {
-    const candidates = pendingCandidatesRef.current.get(peerId) ?? [];
-    pendingCandidatesRef.current.set(peerId, [...candidates, candidate]);
-  }
-
-  function requestNegotiation(peerId: string, iceRestart = false) {
-    if (!shouldCreateOffer(peerId)) return;
-    void createOffer(peerId, iceRestart);
-  }
-
-  function shouldCreateOffer(peerId: string): boolean {
-    return Boolean(myPeerIdRef.current) && myPeerIdRef.current < peerId;
-  }
-
-  function sendRtcState(peerId: string, event: string) {
-    const pc = peerConnectionsRef.current.get(peerId);
-    if (!pc) return;
-    sendWs({
-      type: 'rtc-state',
-      remotePeerId: peerId,
-      event,
-      connectionState: pc.connectionState,
-      iceConnectionState: pc.iceConnectionState,
-      signalingState: pc.signalingState
-    });
-  }
-
-  function isPolitePeer(peerId: string): boolean {
-    return myPeerIdRef.current > peerId;
-  }
-
-  function syncLocalTracks(pc: RTCPeerConnection) {
-    for (const sender of pc.getSenders()) {
-      if (sender.track) pc.removeTrack(sender);
-    }
-    const stream = localStreamRef.current;
-    if (!stream) return;
-    for (const track of stream.getTracks()) pc.addTrack(track, stream);
-  }
-
-  async function changeLocalMedia(next: LocalMediaState) {
     setError('');
+    try {
+      if (localMedia.microphone) {
+        await unpublishLocalSource(Track.Source.Microphone);
+      } else {
+        await liveKitRoom.startAudio().catch(() => undefined);
+        await liveKitRoom.localParticipant.setMicrophoneEnabled(true);
+      }
+      updateLiveKitParticipants(liveKitRoom);
+    } catch (err) {
+      setError(`Не удалось изменить микрофон: ${getErrorMessage(err)}`);
+    }
+  }
 
-    localStreamRef.current?.getTracks().forEach((track) => track.stop());
-    localStreamRef.current = null;
-    setLocalStream(null);
+  async function toggleMicrophoneMute() {
+    const liveKitRoom = liveKitRoomRef.current;
+    const publication = getLocalPublication(Track.Source.Microphone);
+    if (!liveKitRoom || !publication) return;
 
-    if (!next.audio && !next.video) {
-      setLocalMedia(next);
-      sendWs({ type: 'media-state', audio: false, video: false });
-      await renegotiateAllPeers();
+    setError('');
+    try {
+      if (publication.isMuted) {
+        await publication.unmute();
+      } else {
+        await publication.mute();
+      }
+      updateLiveKitParticipants(liveKitRoom);
+    } catch (err) {
+      setError(`Не удалось изменить мьют микрофона: ${getErrorMessage(err)}`);
+    }
+  }
+
+  async function toggleCameraConnection() {
+    const liveKitRoom = liveKitRoomRef.current;
+    if (!liveKitRoom) {
+      setError('Камеры еще не подключены');
       return;
     }
 
+    setError('');
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: next.audio,
-        video: next.video
-          ? {
-              width: { ideal: 640 },
-              height: { ideal: 360 },
-              frameRate: { ideal: 15, max: 24 }
-            }
-          : false
-      });
-      localStreamRef.current = stream;
-      setLocalStream(stream);
-      setLocalMedia(next);
-      sendWs({ type: 'media-state', audio: next.audio, video: next.video });
-      await renegotiateAllPeers();
+      if (localMedia.camera) {
+        await unpublishLocalSource(Track.Source.Camera);
+      } else {
+        await liveKitRoom.localParticipant.setCameraEnabled(true);
+      }
+      updateLiveKitParticipants(liveKitRoom);
     } catch (err) {
-      setError(`Не удалось включить камеру/микрофон: ${getErrorMessage(err)}`);
-      setLocalMedia({ audio: false, video: false });
-      sendWs({ type: 'media-state', audio: false, video: false });
+      setError(`Не удалось изменить камеру: ${getErrorMessage(err)}`);
     }
   }
 
-  async function renegotiateAllPeers() {
-    const peerIds = [...peerConnectionsRef.current.keys()];
-    for (const peerId of peerIds) requestNegotiation(peerId);
+  async function unpublishLocalSource(source: Track.Source) {
+    const liveKitRoom = liveKitRoomRef.current;
+    const publication = getLocalPublication(source);
+    if (!liveKitRoom || !publication?.track) return;
+    await liveKitRoom.localParticipant.unpublishTrack(publication.track, true);
   }
 
-  function removePeer(peerId: string) {
-    peerConnectionsRef.current.get(peerId)?.close();
-    peerConnectionsRef.current.delete(peerId);
-    makingOfferRef.current.delete(peerId);
-    ignoreOfferRef.current.delete(peerId);
-    queuedOfferRef.current.delete(peerId);
-    pendingCandidatesRef.current.delete(peerId);
-    setPeers((current) => current.filter((peer) => peer.peerId !== peerId));
-    setRemoteStreams((current) => {
-      const next = new Map(current);
-      next.delete(peerId);
-      return next;
-    });
+  function getLocalPublication(source: Track.Source): LocalTrackPublication | undefined {
+    return liveKitRoomRef.current?.localParticipant.getTrackPublication(source) as LocalTrackPublication | undefined;
+  }
+
+  function updateLiveKitParticipants(liveKitRoom: Room | null = liveKitRoomRef.current) {
+    if (!liveKitRoom) {
+      setParticipants([]);
+      setLiveKitIdentity('');
+      setLocalMedia({ microphone: false, muted: false, camera: false });
+      return;
+    }
+
+    setLiveKitIdentity(liveKitRoom.localParticipant.identity);
+    setLocalMedia(readLocalMedia(liveKitRoom));
+    setParticipants(buildParticipantTiles(liveKitRoom));
   }
 
   function sendWs(payload: unknown) {
@@ -1103,6 +1009,21 @@ function RoomPage({ token }: { token: string }) {
     window.setTimeout(() => {
       suppressEventsRef.current = false;
     }, 450);
+  }
+
+  async function toggleStageFullscreen() {
+    const stage = stageRef.current;
+    if (!stage || !document.fullscreenEnabled) return;
+
+    try {
+      if (document.fullscreenElement === stage) {
+        await document.exitFullscreen();
+      } else {
+        await stage.requestFullscreen();
+      }
+    } catch (err) {
+      setError(`Не удалось открыть полноэкранный режим: ${getErrorMessage(err)}`);
+    }
   }
 
   const selectedVideo = room?.videos.find((video) => video.id === selectedVideoId) ?? null;
@@ -1136,23 +1057,43 @@ function RoomPage({ token }: { token: string }) {
             ))}
           </div>
         )}
-        <video
-          key={selectedVideoId}
-          ref={videoRef}
-          className="movie-player"
-          src={videoSrc}
-          controls
-          playsInline
-          preload="auto"
-          onLoadedMetadata={onVideoLoaded}
-          onCanPlay={() => maybeSendBufferReady()}
-          onPlay={() => sendSyncAction('play')}
-          onPause={() => sendSyncAction('pause')}
-          onSeeked={() => {
-            sendSyncAction('seek');
-            maybeSendBufferReady();
-          }}
-        />
+        <div ref={stageRef} className="movie-stage">
+          <div className="movie-frame">
+            {document.fullscreenEnabled && (
+              <button className="fullscreen-button" type="button" onClick={() => void toggleStageFullscreen()}>
+                {stageFullscreen ? 'Выйти из полного экрана' : 'Во весь экран с камерами'}
+              </button>
+            )}
+            <video
+              key={selectedVideoId}
+              ref={videoRef}
+              className="movie-player"
+              src={videoSrc}
+              controls
+              playsInline
+              preload="auto"
+              onLoadedMetadata={onVideoLoaded}
+              onCanPlay={() => maybeSendBufferReady()}
+              onPlay={() => sendSyncAction('play')}
+              onPause={() => sendSyncAction('pause')}
+              onSeeked={() => {
+                sendSyncAction('seek');
+                maybeSendBufferReady();
+              }}
+            />
+          </div>
+          <aside className="fullscreen-rail">
+            <CallPanelContent
+              callStatus={callStatus}
+              identity={liveKitIdentity}
+              localMedia={localMedia}
+              participants={participants}
+              onToggleCamera={() => void toggleCameraConnection()}
+              onToggleMicrophone={() => void toggleMicrophoneConnection()}
+              onToggleMute={() => void toggleMicrophoneMute()}
+            />
+          </aside>
+        </div>
         <p className="hint">
           Любой участник может поставить паузу, продолжить просмотр, перемотать или выбрать серию. Это
           синхронизируется у всех зрителей.
@@ -1160,56 +1101,92 @@ function RoomPage({ token }: { token: string }) {
       </section>
 
       <aside className="people-panel">
-        <div className="section-head compact">
-          <div>
-            <p className="eyebrow">Call</p>
-            <h2>Камера и микрофон</h2>
-          </div>
-          {myPeerId && <span className="tiny-id">{myPeerId.slice(0, 8)}</span>}
-        </div>
-        <div className="media-actions">
-          <button
-            className={localMedia.audio ? 'secondary-button active' : 'secondary-button'}
-            type="button"
-            onClick={() => void changeLocalMedia({ ...localMedia, audio: !localMedia.audio })}
-          >
-            {localMedia.audio ? 'Выключить микрофон' : 'Включить микрофон'}
-          </button>
-          <button
-            className={localMedia.video ? 'secondary-button active' : 'secondary-button'}
-            type="button"
-            onClick={() => void changeLocalMedia({ ...localMedia, video: !localMedia.video })}
-          >
-            {localMedia.video ? 'Выключить камеру' : 'Включить камеру'}
-          </button>
-        </div>
-        <div className="tiles">
-          <MediaTile label="Вы" stream={localStream} muted />
-          {peers.map((peer) => (
-            <MediaTile
-              key={peer.peerId}
-              label={`Участник ${peer.peerId.slice(0, 8)} · ${peerMediaLabel(peer)}`}
-              stream={remoteStreams.get(peer.peerId) ?? null}
-              muted
-            />
-          ))}
-          {peers.length === 0 && <p className="muted">Другие участники пока не подключились.</p>}
-        </div>
+        <CallPanelContent
+          callStatus={callStatus}
+          identity={liveKitIdentity}
+          localMedia={localMedia}
+          participants={participants}
+          onToggleCamera={() => void toggleCameraConnection()}
+          onToggleMicrophone={() => void toggleMicrophoneConnection()}
+          onToggleMute={() => void toggleMicrophoneMute()}
+        />
       </aside>
     </main>
   );
 }
 
-function MediaTile({ label, stream, muted }: { label: string; stream: MediaStream | null; muted: boolean }) {
+function CallPanelContent({
+  callStatus,
+  identity,
+  localMedia,
+  participants,
+  onToggleCamera,
+  onToggleMicrophone,
+  onToggleMute
+}: {
+  callStatus: string;
+  identity: string;
+  localMedia: LocalMediaState;
+  participants: ParticipantTileData[];
+  onToggleCamera: () => void;
+  onToggleMicrophone: () => void;
+  onToggleMute: () => void;
+}) {
+  return (
+    <>
+      <div className="section-head compact">
+        <div>
+          <p className="eyebrow">Call</p>
+          <h2>Камера и микрофон</h2>
+        </div>
+        {identity && <span className="tiny-id">{identity.slice(-8)}</span>}
+      </div>
+      <p className="call-status">{callStatus}</p>
+      <div className="media-actions">
+        <button
+          className={localMedia.microphone ? 'secondary-button active' : 'secondary-button'}
+          type="button"
+          onClick={onToggleMicrophone}
+        >
+          {localMedia.microphone ? 'Отключить микрофон' : 'Подключить микрофон'}
+        </button>
+        <button
+          className={localMedia.muted ? 'secondary-button muted' : 'secondary-button'}
+          type="button"
+          disabled={!localMedia.microphone}
+          onClick={onToggleMute}
+        >
+          {localMedia.muted ? 'Снять мьют' : 'Поставить мьют'}
+        </button>
+        <button
+          className={localMedia.camera ? 'secondary-button active' : 'secondary-button'}
+          type="button"
+          onClick={onToggleCamera}
+        >
+          {localMedia.camera ? 'Выключить камеру' : 'Включить камеру'}
+        </button>
+      </div>
+      <div className="tiles">
+        {participants.map((participant) => (
+          <MediaTile key={participant.identity} participant={participant} />
+        ))}
+        {participants.length <= 1 && <p className="muted">Другие участники пока не подключились.</p>}
+      </div>
+    </>
+  );
+}
+
+function MediaTile({ participant }: { participant: ParticipantTileData }) {
   const ref = useRef<HTMLVideoElement>(null);
   const [playBlocked, setPlayBlocked] = useState(false);
+  const { stream, local, video: hasVideo } = participant;
 
   useEffect(() => {
     const video = ref.current;
     if (!video) return;
 
     setPlayBlocked(false);
-    video.muted = muted;
+    video.muted = local;
     video.srcObject = stream;
 
     if (!stream) return;
@@ -1225,21 +1202,85 @@ function MediaTile({ label, stream, muted }: { label: string; stream: MediaStrea
       for (const track of tracks) track.removeEventListener('unmute', play);
       if (video.srcObject === stream) video.srcObject = null;
     };
-  }, [stream, muted]);
+  }, [stream, local]);
 
   return (
     <div className="media-tile">
-      {stream ? (
-        <>
-          <video ref={ref} autoPlay playsInline muted={muted} onClick={() => void ref.current?.play()} />
-          {playBlocked && <div className="empty-tile">Нажмите, чтобы показать видео</div>}
-        </>
-      ) : (
-        <div className="empty-tile">Нет видео</div>
-      )}
-      <span>{label}</span>
+      <div className="media-viewport" onClick={() => void ref.current?.play()}>
+        {stream ? (
+          <video
+            ref={ref}
+            autoPlay
+            playsInline
+            muted={local}
+            className={hasVideo ? '' : 'audio-only-media'}
+            onClick={() => void ref.current?.play()}
+          />
+        ) : null}
+        {!hasVideo && <div className="empty-tile">Камера выключена</div>}
+        {playBlocked && <div className="empty-tile overlay">Нажмите, чтобы включить звук/видео</div>}
+      </div>
+      <span>
+        {participant.label} · {participantMediaLabel(participant)}
+      </span>
     </div>
   );
+}
+
+function buildParticipantTiles(liveKitRoom: Room): ParticipantTileData[] {
+  const localParticipant = liveKitRoom.localParticipant;
+  const remoteParticipants = [...liveKitRoom.remoteParticipants.values()];
+  return [localParticipant, ...remoteParticipants].map((participant) =>
+    buildParticipantTile(participant, participant === localParticipant)
+  );
+}
+
+function buildParticipantTile(participant: Participant, local: boolean): ParticipantTileData {
+  const cameraPublication = participant.getTrackPublication(Track.Source.Camera);
+  const microphonePublication = participant.getTrackPublication(Track.Source.Microphone);
+  const stream = new MediaStream();
+
+  addPublicationTrack(stream, cameraPublication);
+  addPublicationTrack(stream, microphonePublication);
+
+  const hasVideo = Boolean(cameraPublication?.track && !cameraPublication.isMuted);
+  const hasMicrophone = Boolean(microphonePublication);
+  const microphoneMuted = hasMicrophone ? Boolean(microphonePublication?.isMuted) : false;
+
+  return {
+    identity: participant.identity,
+    label: local ? 'Вы' : participant.name || `Участник ${participant.identity.slice(-4).toUpperCase()}`,
+    stream: stream.getTracks().length > 0 ? stream : null,
+    audio: hasMicrophone && !microphoneMuted,
+    muted: microphoneMuted,
+    video: hasVideo,
+    local
+  };
+}
+
+function addPublicationTrack(stream: MediaStream, publication: TrackPublication | undefined) {
+  const track = publication?.track;
+  if (!track || publication.isMuted) return;
+  stream.addTrack(track.mediaStreamTrack);
+}
+
+function readLocalMedia(liveKitRoom: Room): LocalMediaState {
+  const microphone = liveKitRoom.localParticipant.getTrackPublication(Track.Source.Microphone) as
+    | LocalTrackPublication
+    | undefined;
+  const camera = liveKitRoom.localParticipant.getTrackPublication(Track.Source.Camera) as LocalTrackPublication | undefined;
+
+  return {
+    microphone: Boolean(microphone),
+    muted: Boolean(microphone?.isMuted),
+    camera: Boolean(camera && !camera.isMuted)
+  };
+}
+
+function participantMediaLabel(participant: ParticipantTileData): string {
+  const mic = participant.audio ? 'микрофон включен' : participant.muted ? 'микрофон в мьюте' : 'без микрофона';
+  if (participant.video) return mic;
+  return `без камеры, ${mic}`;
 }
 
 class UploadCancelledError extends Error {
@@ -1341,36 +1382,12 @@ function watchSocketUrl(): string {
   return `${protocol}//${window.location.host}/watch/ws`;
 }
 
-function defaultIceServers(): RTCIceServer[] {
-  return [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }];
-}
-
-function hasTurnIceServer(iceServers: RTCIceServer[]): boolean {
-  return iceServers.some((server) => {
-    const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
-    return urls.some((url) => url.startsWith('turn:') || url.startsWith('turns:'));
-  });
-}
-
 function estimateTargetPosition(state: WatchState, serverOffset: number, duration: number): number {
   const serverNow = Date.now() + serverOffset;
   const elapsed = state.playing ? (serverNow - state.updatedAt) / 1000 : 0;
   const target = state.positionSeconds + elapsed;
   const max = Number.isFinite(duration) && duration > 0 ? duration : Number.POSITIVE_INFINITY;
   return Math.max(0, Math.min(target, max));
-}
-
-function upsertPeer(peers: PeerInfo[], peer: PeerInfo): PeerInfo[] {
-  const index = peers.findIndex((item) => item.peerId === peer.peerId);
-  if (index === -1) return [...peers, peer];
-  return peers.map((item) => (item.peerId === peer.peerId ? peer : item));
-}
-
-function peerMediaLabel(peer: PeerInfo): string {
-  if (peer.video && peer.audio) return 'камера и микрофон';
-  if (peer.video) return 'камера';
-  if (peer.audio) return 'микрофон';
-  return 'без камеры';
 }
 
 function episodeNumbers(count: number): number[] {

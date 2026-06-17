@@ -17,7 +17,8 @@ MVP веб-приложения для совместного просмотра
 - Поддержка HTTP `Range` для перемотки и буферизации.
 - Синхронизация `play`, `pause`, `seek`, выбора серии через WebSocket.
 - Коррекция небольшого рассинхрона через `playbackRate`.
-- Камера и микрофон по желанию через WebRTC peer-to-peer.
+- Камера и микрофон по желанию через LiveKit SFU.
+- Полноэкранный режим фильма с правой полосой видео участников.
 - Интерфейс рассчитан на ноутбук, телефон и ТВ.
 - Расширенные структурные логи для отладки.
 - Docker logs ограничены 200 МБ: `20m x 10 files`.
@@ -40,7 +41,7 @@ https://plugin-ai.ru/watch/r/AB7K2Q
 - JSON-хранилище на диске для MVP
 - React + Vite
 - ffmpeg/ffprobe
-- WebSocket + WebRTC
+- WebSocket + LiveKit
 
 ## Локальный запуск
 
@@ -77,15 +78,12 @@ WATCH_LOG_LEVEL=debug
 WATCH_COOKIE_SECURE=true
 WATCH_MAX_UPLOAD_MB=8192
 WATCH_SESSION_TTL_HOURS=24
+WATCH_LIVEKIT_URL=wss://plugin-ai.ru/livekit
+LIVEKIT_API_KEY=devkey
+LIVEKIT_API_SECRET=change-me-to-a-long-random-string
 # Опционально для production: Node авторизует, Nginx отдает видео через X-Accel-Redirect.
 # WATCH_VIDEO_ACCEL_REDIRECT_PREFIX=/watch-internal-media/
 # WATCH_VIDEO_ACCEL_FILE_PREFIX=/data/media
-# Опционально для production WebRTC: TURN relay для строгих NAT/мобильных сетей.
-# WATCH_TURN_URLS=turn:plugin-ai.ru:3478?transport=udp,turn:plugin-ai.ru:3478?transport=tcp
-# WATCH_TURN_SHARED_SECRET=change-me-to-a-long-random-string
-# WATCH_TURN_CREDENTIAL_TTL_SECONDS=21600
-# WATCH_TURN_REALM=plugin-ai.ru
-# WATCH_TURN_EXTERNAL_IP=193.39.68.63
 ```
 
 ## Docker
@@ -96,11 +94,12 @@ docker compose build
 docker compose up -d
 ```
 
-По умолчанию контейнер слушает локально на `127.0.0.1:3012`, чтобы reverse proxy отдавал приложение под `https://plugin-ai.ru/watch`.
+По умолчанию контейнер приложения слушает локально на `127.0.0.1:3012`, чтобы reverse proxy отдавал приложение под `https://plugin-ai.ru/watch`.
+LiveKit signaling слушает локально на `127.0.0.1:7880`, а media ports открываются напрямую: `7881/tcp` и `50000-50100/udp`.
 
 ## Reverse Proxy
 
-Нужно прокинуть `/watch` на `http://127.0.0.1:3012` и сохранить WebSocket upgrade для `/watch/ws`.
+Нужно прокинуть `/watch` на `http://127.0.0.1:3012`, сохранить WebSocket upgrade для `/watch/ws` и прокинуть LiveKit signaling `/livekit/` на `http://127.0.0.1:7880/`.
 Для плавной отдачи больших видео в production лучше включить `X-Accel-Redirect`: Node проверяет код комнаты, а Nginx отдает файл с поддержкой `Range` и `sendfile`.
 
 Пример Nginx:
@@ -122,6 +121,18 @@ location = /watch {
     return 301 /watch/;
 }
 
+location /livekit/ {
+    proxy_pass http://127.0.0.1:7880/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+}
+
 location ^~ /watch-internal-media/ {
     internal;
     alias /opt/watch_together/data/media/;
@@ -135,8 +146,7 @@ location ^~ /watch-internal-media/ {
 ```
 
 Для длинной загрузки больших файлов может понадобиться увеличить proxy timeout/body size в текущем reverse proxy.
-
-Для WebRTC в реальном интернете нужен TURN: один STUN часто не соединяет участников за строгим NAT или мобильными сетями. В `docker-compose.yml` есть сервис `watch-turn` на `3478/tcp`, `3478/udp` и relay UDP range `49160-49200`.
+Для LiveKit нужно открыть на сервере `7881/tcp` и `50000-50100/udp`, иначе камеры/микрофоны не смогут передавать media traffic.
 
 ## Хранение данных
 
@@ -151,6 +161,5 @@ data/media
 ## Ограничения MVP
 
 - Зрители без авторизации, безопасность ссылки держится на коротком случайном коде комнаты.
-- Камера/микрофон сделаны peer-to-peer, что нормально для 2 человек. Для больших комнат нужен SFU, например LiveKit.
 - Браузер может заблокировать удаленный автозапуск видео до первого пользовательского взаимодействия.
 - Абсолютная кадровая синхронизация невозможна, но приложение стремится держать рассинхрон в пределах долей секунды.
