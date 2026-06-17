@@ -442,11 +442,23 @@ function publicPeer(peer: PeerInfo): PeerInfo {
 
 function signalSummary(data: unknown): string {
   if (!data || typeof data !== 'object') return 'unknown';
-  const signal = data as { description?: { type?: unknown }; candidate?: { type?: unknown; protocol?: unknown } };
+  const signal = data as {
+    description?: { type?: unknown };
+    candidate?: { candidate?: unknown; type?: unknown; protocol?: unknown };
+  };
   if (signal.description?.type) return `description:${String(signal.description.type)}`;
   if (signal.candidate) {
-    const type = typeof signal.candidate.type === 'string' ? signal.candidate.type : 'candidate';
-    const protocol = typeof signal.candidate.protocol === 'string' ? signal.candidate.protocol : 'unknown';
+    const rawCandidate = typeof signal.candidate.candidate === 'string' ? signal.candidate.candidate : '';
+    const type = typeof signal.candidate.type === 'string'
+      ? signal.candidate.type
+      : / typ ([a-z]+)/.exec(rawCandidate)?.[1] ?? 'candidate';
+    const protocol = typeof signal.candidate.protocol === 'string'
+      ? signal.candidate.protocol
+      : / udp /i.test(rawCandidate)
+        ? 'udp'
+        : / tcp /i.test(rawCandidate)
+          ? 'tcp'
+          : 'unknown';
     return `candidate:${type}:${protocol}`;
   }
   return 'unknown';
