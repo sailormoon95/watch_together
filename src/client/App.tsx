@@ -774,7 +774,10 @@ function RoomPage({ token }: { token: string }) {
         refreshParticipants();
       });
 
-      await liveKitRoom.connect(credentials.url, credentials.token, { autoSubscribe: true });
+      await liveKitRoom.connect(credentials.url, credentials.token, {
+        autoSubscribe: true,
+        peerConnectionTimeout: 30000
+      });
       if (isStopped()) {
         await liveKitRoom.disconnect(true);
         return;
