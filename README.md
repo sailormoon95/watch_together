@@ -77,6 +77,9 @@ WATCH_LOG_LEVEL=debug
 WATCH_COOKIE_SECURE=true
 WATCH_MAX_UPLOAD_MB=8192
 WATCH_SESSION_TTL_HOURS=24
+# Опционально для production: Node авторизует, Nginx отдает видео через X-Accel-Redirect.
+# WATCH_VIDEO_ACCEL_REDIRECT_PREFIX=/watch-internal-media/
+# WATCH_VIDEO_ACCEL_FILE_PREFIX=/data/media
 ```
 
 ## Docker
@@ -92,6 +95,7 @@ docker compose up -d
 ## Reverse Proxy
 
 Нужно прокинуть `/watch` на `http://127.0.0.1:3012` и сохранить WebSocket upgrade для `/watch/ws`.
+Для плавной отдачи больших видео в production лучше включить `X-Accel-Redirect`: Node проверяет код комнаты, а Nginx отдает файл с поддержкой `Range` и `sendfile`.
 
 Пример Nginx:
 
@@ -110,6 +114,17 @@ location /watch/ {
 
 location = /watch {
     return 301 /watch/;
+}
+
+location ^~ /watch-internal-media/ {
+    internal;
+    alias /opt/watch_together/data/media/;
+    sendfile on;
+    tcp_nopush on;
+    aio threads;
+    add_header Cache-Control "no-store" always;
+    types { video/mp4 mp4; }
+    default_type video/mp4;
 }
 ```
 

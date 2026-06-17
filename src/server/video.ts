@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { Store } from './database.js';
+import { appConfig } from './config.js';
 
 const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
@@ -151,6 +152,9 @@ export async function sendVideoFile(
   mimeType: string
 ): Promise<void> {
   const fileStat = await stat(filePath);
+
+  if (sendAccelRedirect(reply, filePath, mimeType)) return;
+
   const range = request.headers.range;
 
   reply.header('Accept-Ranges', 'bytes');
@@ -191,6 +195,25 @@ export async function sendVideoFile(
       'Content-Range': `bytes ${start}-${end}/${fileStat.size}`
     }
   });
+}
+
+function sendAccelRedirect(reply: FastifyReply, filePath: string, mimeType: string): boolean {
+  if (!appConfig.videoAccelRedirectPrefix) return false;
+
+  const relativePath = path.relative(appConfig.videoAccelFilePrefix, path.resolve(filePath));
+  if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) return false;
+
+  const redirectPath = [
+    appConfig.videoAccelRedirectPrefix.replace(/\/+$/, ''),
+    ...relativePath.split(path.sep).map(encodeURIComponent)
+  ].join('/');
+
+  reply
+    .header('X-Accel-Redirect', redirectPath)
+    .header('Content-Type', mimeType)
+    .header('Cache-Control', 'no-store')
+    .send();
+  return true;
 }
 
 function sendStreamResponse(

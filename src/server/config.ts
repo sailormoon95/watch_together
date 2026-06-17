@@ -22,6 +22,7 @@ function normalizeBaseUrl(raw: string): string {
 }
 
 const dataDir = path.resolve(process.env.WATCH_DATA_DIR ?? './data');
+const mediaDir = path.join(dataDir, 'media');
 const publicBaseUrl = normalizeBaseUrl(
   process.env.WATCH_PUBLIC_BASE_URL ?? 'http://localhost:3000/watch'
 );
@@ -37,9 +38,11 @@ export const appConfig = {
   cookieSecure: readBool('WATCH_COOKIE_SECURE', publicBaseUrl.startsWith('https://')),
   maxUploadBytes: readInt('WATCH_MAX_UPLOAD_MB', 8192) * 1024 * 1024,
   dataDir,
-  mediaDir: path.join(dataDir, 'media'),
+  mediaDir,
   incomingDir: path.join(dataDir, 'incoming'),
-  storePath: path.join(dataDir, 'store.json')
+  storePath: path.join(dataDir, 'store.json'),
+  videoAccelRedirectPrefix: process.env.WATCH_VIDEO_ACCEL_REDIRECT_PREFIX ?? '',
+  videoAccelFilePrefix: path.resolve(process.env.WATCH_VIDEO_ACCEL_FILE_PREFIX ?? mediaDir)
 };
 
 export async function ensureDataDirectories(): Promise<void> {
