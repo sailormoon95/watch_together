@@ -158,8 +158,16 @@ export async function sendVideoFile(
   reply.header('Cache-Control', 'no-store');
 
   if (!range) {
-    reply.header('Content-Length', fileStat.size);
-    reply.send(createReadStream(filePath));
+    sendStreamResponse(request, reply, 200, filePath, {
+      start: undefined,
+      end: undefined,
+      headers: {
+        'Accept-Ranges': 'bytes',
+        'Content-Type': mimeType,
+        'Cache-Control': 'no-store',
+        'Content-Length': fileStat.size
+      }
+    });
     return;
   }
 
@@ -172,10 +180,44 @@ export async function sendVideoFile(
   }
 
   const { start, end } = parsedRange;
-  reply.code(206);
-  reply.header('Content-Length', end - start + 1);
-  reply.header('Content-Range', `bytes ${start}-${end}/${fileStat.size}`);
-  reply.send(createReadStream(filePath, { start, end }));
+  sendStreamResponse(request, reply, 206, filePath, {
+    start,
+    end,
+    headers: {
+      'Accept-Ranges': 'bytes',
+      'Content-Type': mimeType,
+      'Cache-Control': 'no-store',
+      'Content-Length': end - start + 1,
+      'Content-Range': `bytes ${start}-${end}/${fileStat.size}`
+    }
+  });
+}
+
+function sendStreamResponse(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  statusCode: number,
+  filePath: string,
+  options: {
+    start: number | undefined;
+    end: number | undefined;
+    headers: Record<string, string | number>;
+  }
+): void {
+  reply.hijack();
+  const stream = createReadStream(filePath, { start: options.start, end: options.end });
+
+  stream.on('error', (error) => {
+    request.log.error({ error, filePath }, 'video stream failed');
+    reply.raw.destroy(error);
+  });
+
+  request.raw.on('close', () => {
+    stream.destroy();
+  });
+
+  reply.raw.writeHead(statusCode, options.headers);
+  stream.pipe(reply.raw);
 }
 
 function isBrowserMp4(probe: ProbeResult): boolean {
