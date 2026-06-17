@@ -976,7 +976,7 @@ function RoomPage({ token }: { token: string }) {
           src={videoSrc}
           controls
           playsInline
-          preload="metadata"
+          preload="auto"
           onLoadedMetadata={onVideoLoaded}
           onPlay={() => sendSyncAction('play')}
           onPause={() => sendSyncAction('pause')}

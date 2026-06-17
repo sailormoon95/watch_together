@@ -126,7 +126,7 @@ export async function registerWatchSockets(app: FastifyInstance, store: Store): 
             sourcePeerId: peerId,
             serverNow: Date.now(),
             state: runtimeRoom.state
-          });
+          }, peerId);
         }
         return;
       }
@@ -196,7 +196,7 @@ export async function registerWatchSockets(app: FastifyInstance, store: Store): 
   const interval = setInterval(() => {
     const now = Date.now();
     for (const room of rooms.values()) {
-      if (room.clients.size === 0) continue;
+      if (room.clients.size < 2) continue;
       broadcast(room, { type: 'sync-state', serverNow: now, state: room.state });
     }
   }, 5000);
